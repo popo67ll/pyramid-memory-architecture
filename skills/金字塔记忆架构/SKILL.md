@@ -1,5 +1,6 @@
 ---
 name: 金字塔记忆架构
+version: 3.0.0
 description: 通用 AI Agent 记忆架构 Skill。采用"金字塔"分层结构:顶层(AGENTS.md)只放铁律级行为规则,中层(MEMORY.md/SOUL.md/HEARTBEAT.md)放业务规则和人格配置,底层(SKILL.md/TOOLS.md)放技术实现细节。适用于所有新建子 Agent 工作区初始化。触发场景:创建新 Agent、初始化工作区、记忆架构设计、规则录入引导、md 文件冗余检查。
 ---
 
