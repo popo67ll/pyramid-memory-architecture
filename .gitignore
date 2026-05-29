@@ -1,0 +1,30 @@
+# 截图和临时文件
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+!skills/**/*.png
+!skills/**/*.jpg
+
+# 依赖
+node_modules/
+package-lock.json
+
+# 系统文件
+.DS_Store
+
+# OpenClaw 内部
+.openclaw/
+
+# 文档和临时
+articles/
+templates/
+README.md
+
+# 抖音数据文件（不提交 cookie 备份）
+skills/抖音自动化/douyin-auto-ops/data/daemon.out
+skills/抖音自动化/douyin-auto-ops/data/daemon_pid
+skills/抖音自动化/douyin-auto-ops/data/douyin-cookie-backup.json
+skills/抖音自动化/douyin-auto-ops/data/token_usage.json
+skills/抖音自动化/douyin-auto-ops/references/douyin_cookies.json

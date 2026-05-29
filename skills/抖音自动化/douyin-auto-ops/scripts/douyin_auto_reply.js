@@ -1,0 +1,3417 @@
+/**
+ * 石榴·嗨舞舞室抖音自动回复系统
+ * 版本: v75.0 - 修复时间正则漏匹配（纯昨天/小时前/天前）+ 陌生人私信提取修复
+ * 日期: 2026-05-21
+ */
+
+const { addExtra } = require('/Users/popoll/.openclaw/workspace/node_modules/puppeteer-extra/dist/index.cjs.js');
+const StealthPlugin = require('/Users/popoll/.openclaw/workspace/node_modules/puppeteer-extra-plugin-stealth/index.js');
+const puppeteer = addExtra(require('/Users/popoll/.openclaw/workspace/node_modules/puppeteer/lib/cjs/puppeteer/puppeteer.js'));
+puppeteer.use(StealthPlugin());
+const fs = require('fs');
+const path = require('path');
+const { exec } = require('child_process');
+const https = require('https');
+
+// 🐾 v72: 三层推送：QQ API 直发 → CLI 中转 → 队列兜底
+const QQ_REPORT = {
+    OPEN_ID: '62CA6F1CA9E37F25C20D47FB7D134593',
+    CHANNEL: 'qqbot',
+    MAX_RETRIES: 2,
+    // QQ Open Platform API 配置
+    QQ_APP_ID: '1903716491',
+    QQ_CLIENT_SECRET: 'B1riaSLE82xsokhecbaaabcegjmquz5B',
+    QQ_BOT_ID: '1903716491',
+    QQ_API_BASE: 'https://api.sgroup.qq.com',
+};
+
+const CONFIG = {
+    CHECK_INTERVAL: 10 * 60 * 1000,   // 10 分钟(基础值,实际会随机化)
+    CHECK_INTERVAL_MIN: 40 * 60 * 1000,   // 最小 40 分钟(v21 风控:拉长间隔)
+    CHECK_INTERVAL_MAX: 120 * 60 * 1000,  // 最大 120 分钟(v21 风控:随机化)
+    HUMAN_DELAY: { min: 5000, max: 12000 },  // v21: 增大基础延迟
+    CHROME_DEBUG_URL: 'http://localhost:9222',
+    LOG_FILE: '/tmp/douyin_auto_reply.log',
+    COMMENTS_FILE: '/tmp/douyin_comments.json',  // 评论缓存
+    DMS_FILE: '/tmp/douyin_dms.json',             // 私信缓存
+    COOLDOWN_FILE: '/tmp/douyin_cooldown.json',   // 冷却时间持久化
+    MAX_VIDEOS: 5,  // v28.1: 每轮检查最新 5 条视频,覆盖有评论的
+    MAX_REPLIES_PER_RUN: 5,  // 每轮最多回复 5 条(v25加固:更保守的真人节奏)
+    DAILY_REPLY_LIMIT: 40,   // 🐾 v42: 每日回复上限 40 条,防风控
+    DAILY_WECHAT_LIMIT: 10,  // 🐾 v73: 每日主动给微信号上限 10 次,防风控限流
+    CONSECUTIVE_FAILURE_LIMIT: 2,  // v25: 连续失败次数上限,达到后暂停本轮
+    // 活跃时段(小时)
+    ACTIVE_HOURS: [8, 9, 10, 11, 14, 15, 16, 17, 19, 20, 21, 22],
+    // 随机跳过回复的概率(模拟真人偶尔没看到)
+    SKIP_REPLY_CHANCE: 0.05,  // 5%跳过率
+};
+
+// 隐式标记(零宽字符,用户看不见,用于检测是否是我们回的)
+const INVISIBLE_MARK = '\u200B\u200C';
+
+// ====== 豆包·火山方舟 API 配置 ======
+const AI_CONFIG = {
+    BASE_URL: 'https://ark.cn-beijing.volces.com',
+    API_PATH: '/api/v3/chat/completions',
+    API_KEY: 'ark-adca64b0-24b3-4ebf-b105-97caa3fa3a1d-c1785',
+    MODEL: 'ep-m-20260418183606-x48jv',  // 豆包 Seed 1.6 Vision 自定义端点
+    TIMEOUT: 8000,      // 8 秒超时,防止卡死
+    MAX_TOKENS: 150,    // 闲聊回复控制在 150 token 内
+    TOKEN_FILE: '/Users/popoll/.openclaw/workspace/skills/抖音自动化/douyin-auto-ops/data/token_usage.json',
+    TOKEN_LIMIT: 500000,  // 50万 token 上限
+    TOKEN_ALERT_AT: 0.8,  // 80% 时提醒
+};
+
+// Token 消耗追踪
+function trackTokenUsage(usage) {
+    const trackFile = AI_CONFIG.TOKEN_FILE;
+    let track = { total: 0, calls: 0, history: [] };
+    if (fs.existsSync(trackFile)) {
+        try { track = JSON.parse(fs.readFileSync(trackFile, 'utf8')); } catch(e) {}
+    }
+    const callTokens = usage.total_tokens || 0;
+    track.total += callTokens;
+    track.calls++;
+    track.history.push({ time: new Date().toISOString(), tokens: callTokens, total: track.total });
+    // 只保留最近 100 条
+    if (track.history.length > 100) track.history = track.history.slice(-100);
+    fs.writeFileSync(trackFile, JSON.stringify(track, null, 2));
+
+    const pct = (track.total / AI_CONFIG.TOKEN_LIMIT * 100).toFixed(1);
+    log(`🔢 Token 消耗:本次 ${callTokens} | 累计 ${track.total.toLocaleString()} | 总量 ${pct}% | 剩余 ${(AI_CONFIG.TOKEN_LIMIT - track.total).toLocaleString()}`);
+
+    // 80% 以上提醒
+    if (track.total >= AI_CONFIG.TOKEN_LIMIT * AI_CONFIG.TOKEN_ALERT_AT) {
+        log(`⚠️⚠️ Token 即将耗尽!已使用 ${pct}%,剩余 ${(AI_CONFIG.TOKEN_LIMIT - track.total).toLocaleString()} token,请尽快更换模型!`);
+    }
+}
+
+const OUR_REPLIES = [
+    '感谢关注', '有空来线下', '次卡和通卡', '零基础完全',
+    '课表很灵活', '锦湖电脑城', '有任何舞蹈问题',
+    '我们主打爵士舞', '我们有 9.9 元体验课', '五一活动',
+    '正式报名后概不退费', '鸽子行为扣除', '私信我',
+    '加瑶瑶老师微信', '谢谢喜欢', '收到~',
+];
+
+// 我们自己已经回复过的内容(用于去重检测 + 消息提取时过滤)
+const OUR_REPLY_CONTENTS = [
+    '谢谢喜欢呀', '哈哈谢谢', '感谢支持',
+    '收到~有问题随时问', '嗯嗯看到啦', '私信我跟你说',
+    '私信我发你', '私信我帮你约', '私信我发你看看',
+    '加瑶瑶老师微信', '有任何舞蹈问题都可以问我',
+    '有什么想问的随时私信我',
+    '随时私信我', '有啥想问的随时私信我',
+    '私信我发你详细', '有空来线下', '线下一起跳',
+    // v10: 回声引导语(防止提取时误当成用户消息)
+    '哈哈你好呀~想了解舞蹈课还是体验课呀',
+    '嗨嗨~是想问课程还是价格呀',
+    '哈喽~欢迎来玩!是想约体验课还是看课表呀',
+];
+
+// 检测是否是我们自己回的(零宽标记 + 关键词双保险)
+function isOurReply(text) {
+    if (text.includes(INVISIBLE_MARK)) return true;
+    return OUR_REPLIES.some(kw => text.includes(kw));
+}
+
+/**
+ * 五一活动判断(2025-05-01 至 2025-05-25)
+ */
+function isPromotionActive() {
+    const now = new Date();
+    const start = new Date('2025-05-01T00:00:00+08:00');
+    const end = new Date('2025-05-25T23:59:59+08:00');
+    return now >= start && now <= end;
+}
+
+/**
+ * 🐾 v72: 三层推送：QQ API 直发 → CLI 中转 → 队列兜底
+ * 第一层：直接调用 QQ Open Platform API
+ * 第二层：OpenClaw CLI 中转
+ * 第三层：写入队列文件，等 heartbeat 补发
+ */
+
+// ===== 第一层：QQ API 直发 =====
+let qqAccessToken = null;
+let qqTokenExpiry = 0;
+
+async function getQQAccessToken() {
+    if (qqAccessToken && Date.now() < qqTokenExpiry) {
+        return qqAccessToken;
+    }
+    
+    return new Promise((resolve, reject) => {
+        const postData = JSON.stringify({
+            appId: QQ_REPORT.QQ_APP_ID,
+            clientSecret: QQ_REPORT.QQ_CLIENT_SECRET,
+        });
+        
+        const options = {
+            hostname: 'bots.qq.com',
+            port: 443,
+            path: '/app/getAppAccessToken',
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(postData),
+            },
+        };
+        
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try {
+                    const result = JSON.parse(data);
+                    if (result.access_token && result.expires_in) {
+                        qqAccessToken = result.access_token;
+                        // 提前 60 秒过期，避免边界问题
+                        qqTokenExpiry = Date.now() + (parseInt(result.expires_in) - 60) * 1000;
+                        resolve(qqAccessToken);
+                    } else {
+                        reject(new Error('获取 token 失败: ' + data.substring(0, 200)));
+                    }
+                } catch (e) {
+                    reject(new Error('解析 token 失败: ' + e.message));
+                }
+            });
+        });
+        
+        req.on('error', reject);
+        req.setTimeout(10000, () => { req.destroy(); reject(new Error('超时')); });
+        req.write(postData);
+        req.end();
+    });
+}
+
+async function sendViaQQApi(msg) {
+    const token = await getQQAccessToken();
+    
+    return new Promise((resolve, reject) => {
+        const postData = JSON.stringify({
+            content: msg,
+            msg_type: 0, // 文本消息
+        });
+        
+        const options = {
+            hostname: QQ_REPORT.QQ_API_BASE.replace('https://', ''),
+            port: 443,
+            path: `/v2/users/${QQ_REPORT.OPEN_ID}/messages`,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `QQBot ${token}`,
+                'Content-Length': Buffer.byteLength(postData),
+            },
+        };
+        
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                if (res.statusCode === 200 || res.statusCode === 202) {
+                    resolve(true);
+                } else {
+                    reject(new Error(`HTTP ${res.statusCode}: ${data.substring(0, 200)}`));
+                }
+            });
+        });
+        
+        req.on('error', reject);
+        req.setTimeout(15000, () => { req.destroy(); reject(new Error('超时')); });
+        req.write(postData);
+        req.end();
+    });
+}
+
+// ===== 第二层：CLI 中转 =====
+async function sendViaCLI(msg) {
+    const cli = `openclaw message send --target ${QQ_REPORT.OPEN_ID} --channel ${QQ_REPORT.CHANNEL} --message ${JSON.stringify(msg)}`;
+    
+    for (let attempt = 1; attempt <= QQ_REPORT.MAX_RETRIES; attempt++) {
+        try {
+            await new Promise((resolve, reject) => {
+                exec(cli, { timeout: 15000 }, (error, stdout, stderr) => {
+                    if (error) reject(new Error(error.message));
+                    else if (stdout.includes('Sent via QQ Bot')) resolve(stdout);
+                    else reject(new Error('发送未确认: ' + (stdout || stderr).substring(0, 200)));
+                });
+            });
+            return true;
+        } catch(e) {
+            log(`⚠️ CLI 发送失败(尝试 ${attempt}/${QQ_REPORT.MAX_RETRIES}): ${e.message.substring(0, 150)}`);
+            if (attempt >= QQ_REPORT.MAX_RETRIES) {
+                return false;
+            }
+            await sleep(2000 * attempt);
+        }
+    }
+    return false;
+}
+
+// ===== 第三层：写入队列 =====
+function writeReportToQueue(msg) {
+    const reportFile = '/tmp/douyin_report_queue.json';
+    let queue = [];
+    if (fs.existsSync(reportFile) && fs.statSync(reportFile).size > 0) {
+        try { queue = JSON.parse(fs.readFileSync(reportFile, 'utf8')); } catch(e) { queue = []; }
+    }
+    queue.push({ time: Date.now(), message: msg });
+    if (queue.length > 5) queue = queue.slice(-5);
+    fs.writeFileSync(reportFile, JSON.stringify(queue));
+    log('📤 检查报告已写入队列（等 heartbeat 补发）');
+}
+
+// ===== 主函数：三层推送 =====
+async function sendReportToQQ(msg) {
+    // 第一层：QQ API 直发
+    try {
+        const apiOk = await sendViaQQApi(msg);
+        if (apiOk) {
+            log('📤 报告已通过 QQ API 直发（第一层）');
+            return true;
+        }
+    } catch(e) {
+        log(`⚠️ QQ API 失败: ${e.message.substring(0, 150)}，尝试第二层...`);
+    }
+    
+    // 第二层：CLI 中转
+    try {
+        const cliOk = await sendViaCLI(msg);
+        if (cliOk) {
+            log('📤 报告已通过 CLI 中转（第二层）');
+            return true;
+        }
+    } catch(e) {
+        log(`⚠️ CLI 失败: ${e.message.substring(0, 150)}，尝试第三层...`);
+    }
+    
+    // 第三层：写入队列
+    log('⚠️ QQ API + CLI 均失败，写入队列等 heartbeat 补发');
+    writeReportToQueue(msg);
+    return false;
+}
+
+/**
+ * 评论回复模板(只保留业务关键信息,其余走大模型)
+ */
+const COMMENT_REPLIES = {
+    price: function() {
+        return '价格挺实惠的~具体价目私信我发你,选适合的方案就行~';
+    },
+    beginner: '完全可以呀~我们好多学员都是零基础的,来了跟着入门班慢慢学就行,放心来~',
+    schedule: '工作日晚上和周末都有课~具体课表私信我发你看看,选自己方便的时间就行~',
+    location: '在南阳市锦湖电脑城院内 5 楼,到了找嗨舞舞室就行~挺好找的,私信我发你具体定位~',
+    kids: '有少儿班的~4-12 岁小朋友都可以,具体私信聊哈~',
+    trial: '有体验课的!9.9 元一节,一个半小时~想来的话私信我帮你约时间~',
+    dance: '我们有两位老师哦~瑶瑶老师教各种风格爵士和KPOP,刘祺老师教编舞和HipHop~你想学哪种?私信了解更多~',
+    promotion: function() {
+        return '有新活动会第一时间发哦~关注下我们的动态~也可以私信我,有优惠第一时间通知你~';
+    },
+    praise: [
+        '哈哈谢谢宝子夸奖😎 我们舞者超有实力的~继续关注我们,更多精彩舞蹈等你解锁🔥💃',
+        '被你夸得不好意思了🙈 来现场看更炸哦~私信约体验课呀',
+        '哇谢谢喜欢💃 我们的老师超认真的~想学的话私信我安排体验课呀',
+        '嘿嘿被夸了~开心🥳 欢迎来现场感受氛围,私信帮你约课~',
+        '感谢认可🙏 我们会继续加油的~想学跳舞随时私信我呀',
+    ],
+};
+
+/**
+ * 私信回复模板(v21 风控优化: 首轮对话不给微信号,降低风控)
+ */
+const DM_REPLIES = {
+    price: function() {
+        const variants = [
+            '哈喽~我们有次卡和通卡两种,价格挺实惠的~帮你推荐适合的方案~',
+            '价格挺实在的~有次卡和通卡,看你需要哪种~',
+        ];
+        return variants[Math.floor(Math.random() * variants.length)];
+    },
+    beginner: function() {
+        const variants = [
+            '哈喽~零基础完全没问题的!我们有专门的入门班~推荐适合的班型~',
+            '零基础也能学的~有专门的新手班,放心来就行~',
+        ];
+        return variants[Math.floor(Math.random() * variants.length)];
+    },
+    schedule: function() {
+        const variants = [
+            '哈喽~课表挺灵活的,工作日晚上和周末全天都有课~我发你最新的看看~',
+            '时间很灵活的~晚上和周末都有,你大概想什么时候来~',
+        ];
+        return variants[Math.floor(Math.random() * variants.length)];
+    },
+    location: '我们在南阳市车站路与工业南路交叉口·锦湖电脑城院内 5 楼~交通很方便,导航搜锦湖电脑城就行~',
+    kids: function() {
+        const variants = [
+            '哈喽~我们有少儿舞蹈班,4-12 岁小朋友都可以~',
+            '有少儿班的~带小朋友来体验看看~',
+        ];
+        return variants[Math.floor(Math.random() * variants.length)];
+    },
+    trial: function() {
+        const variants = [
+            '哈喽~我们有 9.9 元体验课,一个半小时~帮你约个时间~',
+            '有体验课的~9.9 元一节,一个半小时,哪天方便来试试~',
+        ];
+        return variants[Math.floor(Math.random() * variants.length)];
+    },
+    dance: function() {
+        const variants = [
+            '哈喽~两位老师:瑶瑶老师教各种风格的爵士舞和KPOP,刘祺老师教编舞和HipHop~',
+            '两位老师哦~瑶瑶教爵士KPOP,刘祺教编舞HipHop~你想学哪种~',
+        ];
+        return variants[Math.floor(Math.random() * variants.length)];
+    },
+    promotion: function() {
+        const variants = [
+            '哈喽~有新活动会第一时间发~有优惠也会通知你~',
+            '优惠活动会第一时间通知~关注着别错过~',
+        ];
+        return variants[Math.floor(Math.random() * variants.length)];
+    },
+    // 🐾 v50: 私信要微信直接给
+    wechat: function() {
+        const variants = [
+            '好的~瑶瑶老师微信:150-8338-8123,加的时候备注一下名字哦~',
+            '没问题!瑶瑶老师微信是150 8338 8123,有什么舞蹈问题随时找她~',
+            '来~💚 瑶瑶老师VX:15083388123,加上更方便约课和咨询~',
+            '好的~瑶瑶老师威信:一五零八三三八八一二三,加我备注名字呀~',
+        ];
+        return variants[Math.floor(Math.random() * variants.length)];
+    },
+};
+
+// 业务关键词(只保留关键信息,闲聊走大模型)
+const KEYWORDS = {
+    price: ['价格', '多少钱', '收费', '费用', '学费', '贵', '便宜', '次卡', '通卡', '月卡', '季卡', '年卡', '周卡'],
+    beginner: ['零基础', '不会跳', '没基础', '初学者', '新手', '刚开始'],
+    schedule: ['课表', '时间', '几点', '什么时候', '排课', '上课时间'],
+    location: ['地址', '在哪', '位置', '地方', '导航', '怎么走', '哪里'],
+    kids: ['少儿', '小孩', '小朋友', '孩子', '儿童', '教孩子', '带小孩'],
+    trial: ['体验', '试课', '试听', '试试', '9.9'],
+    dance: ['爵士', 'hiphop', '街舞', '舞种', '什么舞', '编舞', 'kpop', '老师', '教什么'],
+    praise: ['好看', '喜欢', '棒', '赞', '牛逼', '厉害', '好美', '好好看', '不错', '感谢关注'],
+    promotion: ['活动', '优惠', '折扣', '五一', '促销', '便宜点'],
+    // 🐾 v50: 私信要微信直接给
+    wechat: ['微信', '微信号', '加你', '加我', '联系方式', '怎么联系', '加一下', '加个', 'vx', 'VX', '微', '威信'],
+};
+
+// ==================== 🐾 AI 回复反馈系统 ====================
+const FEEDBACK_FILE = '/Users/popoll/.openclaw/workspace/skills/douyin-auto-ops/douyin-reply-feedback.md';
+let feedbackCache = { lastMod: 0, content: '' };
+
+function loadFeedback() {
+    try {
+        const fs = require('fs');
+        const stat = fs.statSync(FEEDBACK_FILE);
+        // 文件没变则用缓存
+        if (stat.mtimeMs === feedbackCache.lastMod) return feedbackCache.content;
+        const raw = fs.readFileSync(FEEDBACK_FILE, 'utf8');
+        feedbackCache.lastMod = stat.mtimeMs;
+        feedbackCache.content = raw;
+        return raw;
+    } catch(e) {
+        return '';
+    }
+}
+
+function buildFeedbackInstruction(type) {
+    const fb = loadFeedback();
+    if (!fb || fb.length < 100) return ''; // 空文件不注入
+
+    // 提取纠正规则
+    const rulesMatch = fb.match(/## 纠正规则[\s\S]*?(?=##|$)/);
+    const rules = rulesMatch ? rulesMatch[0] : '';
+    const hasRules = rules.includes('→');
+
+    // 提取优质话术
+    const goodMatch = fb.match(/## 优质话术参考[\s\S]*?(?=##|$)/);
+    const good = goodMatch ? goodMatch[0] : '';
+    const hasGood = good.length > 30;
+
+    let instruction = '';
+    if (hasRules) {
+        instruction += '\n\n【重要纠正规则-必须遵守】\n' + rules.replace(/## 纠正规则[^\n]*\n/, '').trim();
+    }
+    if (hasGood) {
+        const label = type === 'dm' ? '私信' : '评论';
+        instruction += `\n\n【${label}优质回复参考-请模仿以下风格】\n` + good.replace(/## 优质话术参考[^\n]*\n/, '').trim();
+    }
+    return instruction;
+}
+
+// 🐾 v74: 本轮检测结果详情（供报告使用）
+let __lastResults = { comments: [], dms: [] };
+
+// 🐾 加载嗨舞客服人设(独立文件驱动,修改后即时生效)
+let personaCache = { content: '', lastLoad: 0 };
+function loadPersona() {
+    const now = Date.now();
+    if (now - personaCache.lastLoad < 5 * 60 * 1000 && personaCache.lastLoad > 0) {
+        return personaCache.content;
+    }
+    try {
+        const path = require('path');
+const { exec } = require('child_process');
+        const baseDir = path.join(__dirname, '..', '..', '..', '舞室运营', 'hi-dance-studio');
+        const personaPath = path.join(baseDir, '嗨舞客服人设.md');
+        if (fs.existsSync(personaPath)) {
+            personaCache.content = fs.readFileSync(personaPath, 'utf8');
+            personaCache.lastLoad = now;
+            log('🎭 嗨舞客服人设已加载 ✅');
+        } else {
+            log('⚠️ 嗨舞客服人设文件不存在');
+        }
+    } catch (e) {
+        log(`⚠️ 人设加载失败: ${e.message}`);
+    }
+    return personaCache.content;
+}
+
+// 🐾 动态加载舞室运营资料(方案1:Markdown文件驱动)
+let studioDataCache = { schedule: '', price: '', lastLoad: 0 };
+function loadStudioData() {
+    const now = Date.now();
+    // 每5分钟重新加载一次,确保修改即时生效
+    if (now - studioDataCache.lastLoad < 5 * 60 * 1000 && studioDataCache.lastLoad > 0) {
+        return studioDataCache;
+    }
+    try {
+        const path = require('path');
+const { exec } = require('child_process');
+        const baseDir = path.join(__dirname, '..', '..', '..', '舞室运营', 'hi-dance-studio');
+        const schedulePath = path.join(baseDir, '课程表.md');
+        const pricePath = path.join(baseDir, '价格总表.md');
+        studioDataCache.schedule = fs.existsSync(schedulePath) ? fs.readFileSync(schedulePath, 'utf8') : '';
+        studioDataCache.price = fs.existsSync(pricePath) ? fs.readFileSync(pricePath, 'utf8') : '';
+        studioDataCache.lastLoad = now;
+        if (studioDataCache.schedule || studioDataCache.price) {
+            log(`📚 舞室资料已加载: 课程表=${studioDataCache.schedule ? '✅' : '❌'}, 价格表=${studioDataCache.price ? '✅' : '❌'}`);
+        }
+    } catch (e) {
+        log(`⚠️ 舞室资料加载失败: ${e.message}`);
+    }
+    return studioDataCache;
+}
+
+// 🐾 构建舞室资料注入提示词
+function buildStudioDataPrompt() {
+    const data = loadStudioData();
+    if (!data.schedule && !data.price) return '';
+    let prompt = '\n\n【舞室最新资料-请基于以下信息回复】\n';
+    if (data.price) {
+        prompt += '\n--- 价格信息 ---\n';
+        // 自动判断活动期:2026年5月1日-5月25日期间优先使用活动价
+        const now = new Date();
+        const promotionStart = new Date(2026, 4, 1);  // 5月(月份从0开始)
+        const promotionEnd = new Date(2026, 4, 25);
+        const isPromotion = now >= promotionStart && now <= promotionEnd;
+        prompt += `⚠️当前日期:${now.getFullYear()}年${now.getMonth()+1}月${now.getDate()}日。`;
+        prompt += isPromotion ? '【活动进行中】有人问价格时,优先回复活动优惠价!活动结束后再回复标准价。\n' : '【当前非活动期】有人问价格时,回复标准价格。活动价仅供参考,不要在非活动期报活动价。\n';
+        // 提取关键价格信息(去除markdown格式噪音)
+        prompt += data.price.replace(/[#|*`>-]/g, '').replace(/\n{3,}/g, '\n\n').trim();
+    }
+    if (data.schedule) {
+        prompt += '\n\n--- 课程表信息 ---\n';
+        // 提取课程表关键信息
+        prompt += data.schedule.replace(/[#|*`>-]/g, '').replace(/\n{3,}/g, '\n\n').trim();
+    }
+    return prompt;
+}
+
+// 大模型生成回复(闲聊类,带超时保护)
+function callAI(content, type = 'comment') {
+    return new Promise((resolve) => {
+        const url = new URL(AI_CONFIG.API_PATH, AI_CONFIG.BASE_URL);
+
+        const basePrompt = type === 'dm'
+            ? '你是嗨舞舞蹈工作室的运营者,负责回复私信。⚠️对方已经在私信里了,绝对不要再说"私信我/私信聊/私信你"这种话!语气要像真人朋友聊天一样,有趣、有梗、会调侃,不要像客服机器人。回复要简短(50字以内),适当使用emoji。如果对方问价格/地址/课表/体验课,直接回答即可,不需要引导私信。舞室在南阳市锦湖电脑城院内5楼。舞室有两位老师:瑶瑶老师教各种风格的爵士舞和KPOP,刘祺老师教编舞和HipHop。回答重点问题后可以加一句轻松调侃,让聊天更有趣。注意:如果对方主动要微信/联系方式,直接给瑶瑶老师微信号(格式要多样化,用横杠/空格/中文数字交替,不要每次都写纯数字);如果对方没要,聊了1-2轮后可以在回复末尾自然引导加微信,不要太刻意。'
+            : '你是嗨舞舞蹈工作室的抖音账号运营者,负责回复评论区。语气要像真人朋友聊天一样,有趣、有梗、会调侃,不要像客服机器人。回复要简短(50字以内),适当使用emoji。【闲聊/夸奖类(好棒、好看、喜欢等)】正常闲聊回应即可,谢谢夸奖、开心调侃,不要提私信、不要推课。【业务咨询类(价格、地址、课表、体验课)】简单回答后引导私信获取详情。不要在评论区暴露舞室地址和老师名字。⚠️绝对不要提"没有电梯"!⚠️绝对不要在评论区暴露老师名字!只说"老师"或"我们老师"。⚠️绝对不要在评论区暴露舞室地址!不要说"锦湖电脑城"或任何具体地址。不要给微信号。';
+
+        const studioPrompt = buildStudioDataPrompt();
+        const systemPrompt = basePrompt + studioPrompt + buildFeedbackInstruction(type);
+
+        const postData = JSON.stringify({
+            model: AI_CONFIG.MODEL,
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: content }
+            ],
+            max_tokens: AI_CONFIG.MAX_TOKENS,
+            temperature: 0.8,
+        });
+
+        const options = {
+            hostname: url.hostname,
+            port: 443,
+            path: url.pathname,
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${AI_CONFIG.API_KEY}`,
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(postData),
+            },
+        };
+
+        const req = require('https').request(options, (res) => {
+            let data = '';
+            res.on('data', (chunk) => { data += chunk; });
+            res.on('end', () => {
+                try {
+                    const json = JSON.parse(data);
+                    if (json.choices && json.choices[0] && json.choices[0].message) {
+                        // 防御:如果 AI 返回 "undefined",拦截它 (使用 includes 防止隐藏字符绕过)
+                        if (json.choices[0].message.content.trim().toLowerCase().includes("undefined")) {
+                            log(`⚠️ AI 接口返回了包含 "undefined" 的内容,强制拦截`);
+                            resolve(null);
+                            return;
+                        }
+                        let reply = json.choices[0].message.content.trim();
+                        // 限制长度
+                        if (reply.length > 100) reply = reply.substring(0, 100);
+                        // 记录 token 消耗
+                        if (json.usage) trackTokenUsage(json.usage);
+                        resolve(reply + INVISIBLE_MARK);
+                    } else {
+                        log(`⚠️ AI 返回异常:${JSON.stringify(json).substring(0, 100)}`);
+                        resolve(null);
+                    }
+                } catch (e) {
+                    // v37.0: 打印详细解析错误
+                    log(`⚠️ AI 解析失败: [${e.message}] JSON内容片段: ${data.substring(0, 100)}`);
+                    resolve(null);
+                }
+            });
+        });
+
+        req.on('error', (e) => {
+            log(`⚠️ AI 请求失败:${e.message.substring(0, 100)}`);
+            resolve(null);
+        });
+
+        // 超时保护
+        req.setTimeout(AI_CONFIG.TIMEOUT, () => {
+            req.destroy();
+            log('⚠️ AI 请求超时');
+            resolve(null);
+        });
+
+        req.write(postData);
+        req.end();
+    });
+}
+
+// 🐾 v68: AI 上下文私信对话(带历史记录 + wechatGiven 标记)
+function callAIWithHistory(userMessage, history, wechatGiven, type = 'dm') {
+    return new Promise((resolve) => {
+        const personaText = loadPersona();
+        const studioData = loadStudioData();
+        const fbInstruction = buildFeedbackInstruction(type);
+
+        // 构建对话历史文本
+        let historyText = '';
+        if (history && history.length > 0) {
+            historyText = '\n\n【对话历史】\n';
+            history.forEach(msg => {
+                const prefix = msg.role === 'user' ? '对方' : '你';
+                historyText += `${prefix}: ${msg.content}\n`;
+            });
+            historyText += `对方: ${userMessage}\n`;
+        }
+
+        // 构建舞室资料
+        let studioText = '';
+        if (studioData.price || studioData.schedule) {
+            studioText = '\n\n【舞室资料】\n';
+            if (studioData.price) studioText += studioData.price.replace(/[#|*`>-]/g, '').replace(/\n{3,}/g, '\n\n').trim() + '\n';
+            if (studioData.schedule) studioText += studioData.schedule.replace(/[#|*`>-]/g, '').replace(/\n{3,}/g, '\n\n').trim() + '\n';
+        }
+
+        // 状态标记(考虑wechatGiven + 每日上限)
+        const dailyWechatLimitReached = isWechatDailyLimitReached();
+        const statusText = wechatGiven
+            ? '\n\n⚠️ 对方已经收到过微信号,绝对不要再提微信号!'
+            : dailyWechatLimitReached
+            ? '\n\n⚠️ 今日微信号已给太多(已达上限),不要再主动引导加微信了!但如果对方主动要微信,仍然要给。'
+            : '\n\n对方还没收到微信号,聊了1-2轮后可以在回复末尾自然引导加微信。注意给微信号时用不同格式呈现,不要每次都写纯数字,可以用横杠分隔(150-8338-8123)、空格分隔(150 8338 8123)、或中文数字(一五零八三三八八一二三)。';
+
+        // 组合系统提示词(优先使用人设文件,fallback 到硬编码)
+        let systemPrompt;
+        if (personaText && personaText.length > 100) {
+            const dmRulesMatch = personaText.match(/## 私信回复规则([\s\S]*?)(?=##|$)/);
+            const basePrompt = dmRulesMatch ? dmRulesMatch[1].trim() : '';
+            const identityMatch = personaText.match(/## 基础身份([\s\S]*?)(?=##|$)/);
+            const identity = identityMatch ? identityMatch[1].trim() : '';
+            systemPrompt = `你是嗨舞舞蹈工作室的运营AI。\n\n【身份】\n${identity}\n\n【私信回复规则】\n${basePrompt}${statusText}${historyText}${studioText}${fbInstruction}`;
+        } else {
+            systemPrompt = `你是嗨舞舞蹈工作室的运营者,负责回复私信。⚠️对方已经在私信里了,绝对不要再说"私信我/私信聊/私信你"这种话!语气要像真人朋友聊天一样,有趣、有梗、会调侃,不要像客服机器人。回复要简短(50字以内),适当使用emoji。如果对方问价格/地址/课表/体验课,直接回答即可,不需要引导私信。舞室在南阳市锦湖电脑城院内5楼。舞室有两位老师:瑶瑶老师教各种风格的爵士舞和KPOP,刘祺老师教编舞和HipHop。回答重点问题后可以加一句轻松调侃,让聊天更有趣。注意:如果对方主动要微信/联系方式,直接给瑶瑶老师微信号(格式要多样化,不要每次都写纯数字);如果对方没要,聊了1-2轮后可以在回复末尾自然引导加微信,不要太刻意。${statusText}${historyText}${studioText}`;
+        }
+
+        const url = new URL(AI_CONFIG.API_PATH, AI_CONFIG.BASE_URL);
+        const postData = JSON.stringify({
+            model: AI_CONFIG.MODEL,
+            messages: [
+                { role: 'system', content: systemPrompt },
+                { role: 'user', content: userMessage }
+            ],
+            max_tokens: AI_CONFIG.MAX_TOKENS,
+            temperature: 0.8,
+        });
+
+        const options = {
+            hostname: url.hostname,
+            port: 443,
+            path: url.pathname,
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${AI_CONFIG.API_KEY}`,
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(postData),
+            },
+        };
+
+        const req = require('https').request(options, (res) => {
+            let data = '';
+            res.on('data', (chunk) => { data += chunk; });
+            res.on('end', () => {
+                try {
+                    const json = JSON.parse(data);
+                    if (json.choices && json.choices[0] && json.choices[0].message) {
+                        let reply = json.choices[0].message.content.trim();
+                        if (reply.length > 100) reply = reply.substring(0, 100);
+                        if (json.usage) trackTokenUsage(json.usage);
+                        resolve(reply + INVISIBLE_MARK);
+                    } else {
+                        log(`⚠️ AI 返回异常:${JSON.stringify(json).substring(0, 100)}`);
+                        resolve(null);
+                    }
+                } catch (e) {
+                    log(`⚠️ AI 解析失败: [${e.message}]`);
+                    resolve(null);
+                }
+            });
+        });
+
+        req.on('error', (e) => {
+            log(`⚠️ AI 请求失败:${e.message.substring(0, 100)}`);
+            resolve(null);
+        });
+
+        req.setTimeout(AI_CONFIG.TIMEOUT, () => {
+            req.destroy();
+            log('⚠️ AI 请求超时');
+            resolve(null);
+        });
+
+        req.write(postData);
+        req.end();
+    });
+}
+
+// 大模型兜底回复(AI 失败时用)
+const FALLBACK_REPLIES = {
+    comment: ['哈哈看到啦~有啥想聊的随便说~', '嗯嗯~来玩呀💃', '好的呢~想了解什么都行~'],
+    dm: ['哈哈好的~有啥想问的随时来问我~', '嗯嗯~有问题随时找我呀~', '收到~想聊的随便聊~'],
+};
+
+/**
+ * 生成回复(区分评论和私信)
+ * 业务类走模板,闲聊类走大模型
+ * 自动加隐式零宽标记
+ * type: 'comment' | 'dm'
+ */
+async function generateReply(content, type = 'comment') {
+    const templates = type === 'dm' ? DM_REPLIES : COMMENT_REPLIES;
+
+    // 空内容用兜底回复
+    if (!content || content === '[表情/图片]') {
+        const fallbacks = FALLBACK_REPLIES[type];
+        return fallbacks[Math.floor(Math.random() * fallbacks.length)] + INVISIBLE_MARK;
+    }
+
+    // 🐾 v42.0: 混合回复模式 - 先匹配业务关键词
+    const lower = content.toLowerCase();
+    for (const [key, words] of Object.entries(KEYWORDS)) {
+        if (words.some(w => lower.includes(w))) {
+            const tpl = templates[key];
+            // 🐾 v39.1: 模板不存在时 fallback 到 AI
+            if (!tpl) {
+                log(`⚠️ 模板缺失 [${key}], fallback 到 AI`);
+                break;
+            }
+
+            // 🐾 v42.0: 混合模式 - praise 类 30% 概率走 AI,增加多样性
+            if (key === 'praise' && Array.isArray(tpl) && Math.random() < 0.3) {
+                log(`🎲 praise 评论命中模板,但 30% 随机触发走 AI`);
+                break; // 跳出循环,走下面的 AI 逻辑
+            }
+
+            if (typeof tpl === 'function') return tpl() + INVISIBLE_MARK;
+            if (Array.isArray(tpl)) return tpl[Math.floor(Math.random() * tpl.length)] + INVISIBLE_MARK;
+            return tpl + INVISIBLE_MARK;
+        }
+    }
+
+    // 没有匹配到业务关键词 → 走大模型
+    try {
+        log(`🔍 AI诊断: callAI("${content.substring(0, 30)}", "${type}")`);
+        const aiReply = await callAI(content, type);
+        log(`🔍 AI诊断: callAI返回 typeof=${typeof aiReply}, value=${aiReply ? aiReply.substring(0, 60) : 'null/empty'}`);
+        // v35.0: 在 generateReply 层再次拦截 undefined
+        if (!aiReply || aiReply === "undefined" || typeof aiReply !== 'string' || aiReply.toLowerCase().includes("undefined")) {
+            log(`⚠️ generateReply 拦截: AI返回无效 (${aiReply})`);
+            throw new Error("AI returned undefined");
+        }
+        if (aiReply) {
+            recordReply(content, aiReply, type);
+            return aiReply;
+        }
+    } catch (e) {
+        log(`⚠️ 大模型异常:${e.message.substring(0, 80)}`);
+    }
+
+    // AI 失败 → 用兜底回复
+    log('⚠️ AI 不可用,使用兜底回复');
+    const fallbacks = FALLBACK_REPLIES[type];
+    return fallbacks[Math.floor(Math.random() * fallbacks.length)] + INVISIBLE_MARK;
+}
+
+/**
+ * 记录 AI 回复到反馈文件,方便后续审查和优化
+ */
+function recordReply(originalContent, aiReply, type) {
+    try {
+        const fs = require('fs');
+        const time = new Date().toLocaleString('zh-CN', { hour12: false });
+        const label = type === 'dm' ? '私信' : '评论';
+        const entry = `- [${time}] ${label}: "${originalContent.substring(0, 30)}" → "${aiReply.replace(INVISIBLE_MARK, '').substring(0, 60)}"`;
+
+        if (!fs.existsSync(FEEDBACK_FILE)) {
+            fs.writeFileSync(FEEDBACK_FILE, `# 嗨舞AI回复训练反馈\n\n## 纠正规则(重要!优先执行)\n<!-- 格式: [问题类型] 错误描述 → 正确说法 -->\n\n\n## 优质话术参考\n<!-- 记录好的回复风格,让 AI 学习模仿 -->\n\n\n## 最近回复记录\n<!-- 最近 10 条 AI 回复,方便审查 -->\n`, 'utf8');
+        }
+
+        let content = fs.readFileSync(FEEDBACK_FILE, 'utf8');
+
+        // 找到"最近回复记录"部分
+        const sectionMatch = content.match(/(## 最近回复记录[\s\S]*$)/);
+        if (sectionMatch) {
+            const section = sectionMatch[1];
+            // 提取已有记录,最多保留 10 条
+            const lines = section.split('\n').filter(l => l.startsWith('- ['));
+            lines.unshift(entry);
+            const recent = lines.slice(0, 10);
+            const newSection = '## 最近回复记录\n<!-- 最近 10 条 AI 回复,方便审查 -->\n' + recent.join('\n') + '\n';
+            content = content.replace(sectionMatch[1], newSection);
+            fs.writeFileSync(FEEDBACK_FILE, content, 'utf8');
+        }
+    } catch(e) {
+        // 记录失败不影响主流程
+    }
+}
+
+function log(msg) {
+    const time = new Date().toLocaleString('zh-CN', { hour12: false });
+    process.stderr.write(`[${time}] ${msg}\n`);
+}
+
+function sleep(ms) {
+    return new Promise(r => setTimeout(r, ms));
+}
+
+function randomDelay(min, max) {
+    return new Promise(r => setTimeout(r, min + Math.random() * (max - min)));
+}
+
+// ==================== 🐾 真人行为模拟函数 ====================
+
+/**
+ * 贝塞尔曲线鼠标移动
+ * 模拟真人从 A 点慢慢移动到 B 点,带随机偏移
+ */
+async function humanMouseMove(page, fromX, fromY, toX, toY) {
+    const duration = 300 + Math.random() * 400; // 300-700ms
+    const steps = 15 + Math.floor(Math.random() * 10); // 15-24 步
+
+    // 先移动到起点
+    await page.mouse.move(fromX, fromY);
+    await sleep(50 + Math.random() * 100);
+
+    for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        // 使用 ease-in-out 曲线(开始和结束慢,中间快)
+        const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+        // 加入随机偏移(模拟人手抖动)
+        const jitter = 2; // ±2px
+        const x = fromX + (toX - fromX) * eased + (Math.random() - 0.5) * jitter;
+        const y = fromY + (toY - fromY) * eased + (Math.random() - 0.5) * jitter;
+        await page.mouse.move(Math.round(x), Math.round(y));
+        await sleep(duration / steps);
+    }
+}
+
+/**
+ * 真人模拟点击:鼠标轨迹移动 + 随机偏移位置 + 按下/抬起延迟
+ */
+async function humanClick(page, targetX, targetY, pageWidth = 1920) {
+    // 从屏幕随机位置开始移动(模拟视线转移)
+    const startX = Math.random() * pageWidth * 0.8 + pageWidth * 0.1;
+    const startY = Math.random() * 200 + 100;
+
+    // 点击位置随机偏移(不点精确中心)
+    const offsetX = (Math.random() - 0.5) * 16; // ±8px
+    const offsetY = (Math.random() - 0.5) * 10; // ±5px
+    const clickX = targetX + offsetX;
+    const clickY = targetY + offsetY;
+
+    // 移动鼠标过去
+    await humanMouseMove(page, startX, startY, clickX, clickY);
+
+    // 按下前有微小停顿(人看到按钮的瞬间)
+    await sleep(80 + Math.random() * 120);
+
+    // 鼠标按下
+    await page.mouse.down({ button: 'left' });
+    await sleep(50 + Math.random() * 80); // 按住 50-130ms
+
+    // 鼠标抬起
+    await page.mouse.up({ button: 'left' });
+
+    // 点击后停顿(确认操作结果)
+    await sleep(100 + Math.random() * 300);
+}
+
+/**
+ * 模拟真人打字:有快有慢、偶尔停顿思考
+ */
+async function humanType(page, text) {
+    for (const char of text) {
+        await page.keyboard.type(char, { delay: 0 });
+        // 基础打字速度 30-120ms
+        let delay = 30 + Math.random() * 90;
+        // 标点符号后停顿更长(人在思考下一句)
+        if ([',', '。', '!', '?', '~', '...', ',', '.', '!', '?'].includes(char)) {
+            delay += 200 + Math.random() * 400;
+        }
+        // 偶尔长停顿(3% 概率,像在犹豫怎么打)
+        if (Math.random() < 0.03) {
+            delay += 800 + Math.random() * 1500;
+        }
+        await sleep(delay);
+    }
+}
+
+/**
+ * 模拟真人浏览:随机滚动、偶尔回滚、停留阅读
+ */
+async function humanScroll(page) {
+    const scrolls = 3 + Math.floor(Math.random() * 4); // 3-6 次滚动
+    const viewportH = await page.evaluate(() => window.innerHeight);
+
+    for (let i = 0; i < scrolls; i++) {
+        const distance = viewportH * (0.3 + Math.random() * 0.5); // 滚动 30%-80% 屏幕高度
+        await page.evaluate((d) => window.scrollBy({ top: d, behavior: 'smooth' }), distance);
+        await sleep(600 + Math.random() * 1500); // 停留阅读
+
+        // 偶尔回滚一点(25% 概率,像人回去再看一眼)
+        if (Math.random() < 0.25) {
+            await page.evaluate((d) => window.scrollBy({ top: -d, behavior: 'smooth' }), 50 + Math.random() * 150);
+            await sleep(400 + Math.random() * 800);
+        }
+    }
+}
+
+/**
+ * 智能填充:先点击输入框,等焦点出现后再打字
+ */
+async function humanFillInput(page, selector, text) {
+    // 先定位并点击输入框
+    const inputEl = await page.$(selector);
+    if (inputEl) {
+        const box = await inputEl.boxModel();
+        if (box) {
+            const centerX = Math.round((box.content[0].x + box.content[2].x) / 2);
+            const centerY = Math.round((box.content[0].y + box.content[3].y) / 2);
+            await humanClick(page, centerX, centerY);
+            await sleep(200 + Math.random() * 300); // 等待输入框获得焦点
+        }
+    }
+    // 清空现有内容
+    await page.keyboard.down('Control');
+    await page.keyboard.press('a');
+    await page.keyboard.up('Control');
+    await sleep(100);
+    // 模拟真人打字
+    await humanType(page, text);
+}
+
+/**
+ * 获取轮询间隔
+ * v21 风控优化: 全天随机 40-120 分钟,不固定时间
+ */
+function getNextCheckInterval() {
+    // v21: 全天随机 40-120 分钟,避免固定间隔被风控
+    const minMs = CONFIG.CHECK_INTERVAL_MIN;
+    const maxMs = CONFIG.CHECK_INTERVAL_MAX;
+    return minMs + Math.random() * (maxMs - minMs);
+}
+
+/**
+ * 随机决定是否跳过回复(模拟真人偶尔没看到某条评论)
+ */
+function shouldSkipReply() {
+    return Math.random() < CONFIG.SKIP_REPLY_CHANCE;
+}
+
+// 🐾 v42: 每日回复计数
+const DAILY_COUNT_FILE = '/tmp/douyin_daily_count.json';
+function getTodayReplyCount() {
+    try {
+        if (fs.existsSync(DAILY_COUNT_FILE)) {
+            const data = JSON.parse(fs.readFileSync(DAILY_COUNT_FILE, 'utf8'));
+            const today = new Date().toISOString().slice(0, 10);
+            if (data.date === today) return data.count || 0;
+        }
+    } catch(e) {}
+    return 0;
+}
+function incrementDailyCount() {
+    const today = new Date().toISOString().slice(0, 10);
+    let data = { date: today, count: 0 };
+    try {
+        if (fs.existsSync(DAILY_COUNT_FILE)) {
+            data = JSON.parse(fs.readFileSync(DAILY_COUNT_FILE, 'utf8'));
+            if (data.date !== today) data = { date: today, count: 0 };
+        }
+    } catch(e) {}
+    data.count++;
+    fs.writeFileSync(DAILY_COUNT_FILE, JSON.stringify(data, null, 2));
+    log(`📊 今日回复计数: ${data.count}/${CONFIG.DAILY_REPLY_LIMIT}`);
+}
+function isDailyLimitReached() {
+    return getTodayReplyCount() >= CONFIG.DAILY_REPLY_LIMIT;
+}
+
+// 🐾 v73: 每日微信号计数(主动引导+模板都给)
+const DAILY_WECHAT_FILE = '/tmp/douyin_wechat_count.json';
+function getTodayWechatCount() {
+    try {
+        if (fs.existsSync(DAILY_WECHAT_FILE)) {
+            const data = JSON.parse(fs.readFileSync(DAILY_WECHAT_FILE, 'utf8'));
+            const today = new Date().toISOString().slice(0, 10);
+            if (data.date === today) return data.count || 0;
+        }
+    } catch(e) {}
+    return 0;
+}
+function incrementWechatCount() {
+    const today = new Date().toISOString().slice(0, 10);
+    let data = { date: today, count: 0 };
+    try {
+        if (fs.existsSync(DAILY_WECHAT_FILE)) {
+            data = JSON.parse(fs.readFileSync(DAILY_WECHAT_FILE, 'utf8'));
+            if (data.date !== today) data = { date: today, count: 0 };
+        }
+    } catch(e) {}
+    data.count++;
+    fs.writeFileSync(DAILY_WECHAT_FILE, JSON.stringify(data, null, 2));
+    log(`📱 v73: 今日微信号已给 ${data.count}/${CONFIG.DAILY_WECHAT_LIMIT} 次`);
+}
+function isWechatDailyLimitReached() {
+    return getTodayWechatCount() >= CONFIG.DAILY_WECHAT_LIMIT;
+}
+
+function loadComments() {
+    try {
+        if (fs.existsSync(CONFIG.COMMENTS_FILE)) {
+            const data = JSON.parse(fs.readFileSync(CONFIG.COMMENTS_FILE, 'utf8'));
+            return Array.isArray(data) ? data : [];
+        }
+    } catch (e) {}
+    return [];
+}
+
+function saveComments(data) {
+    if (data.length > 500) data = data.slice(-500);
+    fs.writeFileSync(CONFIG.COMMENTS_FILE, JSON.stringify(data, null, 2));
+}
+
+function loadDMs() {
+    try {
+        if (fs.existsSync(CONFIG.DMS_FILE)) {
+            const data = JSON.parse(fs.readFileSync(CONFIG.DMS_FILE, 'utf8'));
+            return Array.isArray(data) ? data : [];
+        }
+    } catch (e) {}
+    return [];
+}
+
+function saveDMs(data) {
+    if (data.length > 500) data = data.slice(-500);
+    fs.writeFileSync(CONFIG.DMS_FILE, JSON.stringify(data, null, 2));
+}
+
+function loadCooldown() {
+    try {
+        if (fs.existsSync(CONFIG.COOLDOWN_FILE)) {
+            return JSON.parse(fs.readFileSync(CONFIG.COOLDOWN_FILE, 'utf8'));
+        }
+    } catch (e) {}
+    return {};
+}
+
+function saveCooldown(data) {
+    fs.writeFileSync(CONFIG.COOLDOWN_FILE, JSON.stringify(data, null, 2));
+}
+
+function loadReplied() {
+    // 兼容旧版:如果新文件不存在但旧文件存在,迁移数据
+    if (!fs.existsSync(CONFIG.COMMENTS_FILE) || !fs.existsSync(CONFIG.DMS_FILE)) {
+        try {
+            if (fs.existsSync(CONFIG.REPLIED_FILE)) {
+                const oldData = JSON.parse(fs.readFileSync(CONFIG.REPLIED_FILE, 'utf8'));
+                if (oldData && typeof oldData === 'object' && !Array.isArray(oldData)) {
+                    if (!fs.existsSync(CONFIG.COMMENTS_FILE)) saveComments(oldData.comments || []);
+                    if (!fs.existsSync(CONFIG.DMS_FILE)) saveDMs(oldData.dms || []);
+                }
+            }
+        } catch (e) {}
+    }
+    return { comments: loadComments(), dms: loadDMs() };
+}
+
+function saveReplied(data) {
+    saveComments(data.comments);
+    saveDMs(data.dms);
+}
+
+// ==================== DOM 精准解析评论 ====================
+
+// v11: 提取单个视频的评论(供遍历调用)
+const extractCommentsFromPage = async (page, excludeUsers) => {
+    // 滚动加载
+    await page.evaluate(async () => {
+        let lastHeight = 0;
+        let attempts = 0;
+        while (attempts < 8) {
+            const h = document.documentElement.scrollHeight;
+            if (h === lastHeight) attempts++;
+            else attempts = 0;
+            lastHeight = h;
+            window.scrollBy(0, 600);
+            await new Promise(r => setTimeout(r, 500));
+        }
+        window.scrollTo(0, 0);
+    });
+    await randomDelay(1000, 1500);
+
+    const comments = await page.evaluate((excludeUsers, ourReplies, ourReplyContents, invisibleMark) => {
+        const results = [];
+        const seenKeys = new Set();
+        const timePattern = /^(\d+(分钟前|小时前|天前)|刚刚|昨天)/;
+        const pureNumberPattern = /^\d+$/;
+        const processed = new Set();
+        const filterKeywords = ['作者', '回复', '删除', '举报', '去发布作品', '发送', '置顶已读删除', '全部', '最新', '热门', '推荐', '管理'];
+
+        // 策略:找到所有 "删除" 按钮,对每个按钮找到它所属的最小评论项容器
+        const deleteButtons = [];
+        const allEls = document.querySelectorAll('*');
+        for (const el of allEls) {
+            if (el.textContent.trim() === '删除') {
+                const rect = el.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0 && rect.y > 300) {
+                    deleteButtons.push(el);
+                }
+            }
+        }
+
+        // 调试信息
+        const debugInfo = { deleteBtns: deleteButtons.length, containers: 0, skipped: 0 };
+
+        for (const delBtn of deleteButtons) {
+            // 🐾 v21策略1: 快速定位到含1个"删除"+"回复"的容器(不依赖高度判断)
+            let container = delBtn.parentElement;
+            while (container) {
+                const text = container.textContent || '';
+                const delCount = (text.match(/删除/g) || []).length;
+                if (delCount === 1 && text.includes('回复')) {
+                    const parent = container.parentElement;
+                    if (parent) {
+                        const parentDelCount = (parent.textContent.match(/删除/g) || []).length;
+                        if (parentDelCount === 1) {
+                            container = parent;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                if (!container.parentElement) break;
+                container = container.parentElement;
+            }
+            if (!container) { debugInfo.skipped++; continue; }
+
+            // 🐾 v21策略2: 候选收集+最小选择,精确定位单条评论项容器
+
+            const candidates = [];
+            let c = delBtn.parentElement;
+            let depth = 0;
+            while (c && depth < 10) {
+                const cText = c.textContent || '';
+                const cDelCount = (cText.match(/删除/g) || []).length;
+                if (cDelCount === 1 && cText.includes('回复')) {
+                    const cRect = c.getBoundingClientRect();
+                    if (cRect.height >= 60 && cRect.height <= 400 && cRect.width > 100) {
+                        candidates.push({ el: c, height: cRect.height, area: cRect.width * cRect.height });
+                    }
+                }
+                c = c.parentElement;
+                depth++;
+            }
+            if (candidates.length > 0) {
+                candidates.sort((a, b) => a.area - b.area);
+                container = candidates[0].el;
+            }
+
+            // 最终验证
+            const finalText = container.textContent || '';
+            if ((finalText.match(/删除/g) || []).length !== 1) { debugInfo.skipped++; continue; }
+
+            const rect = container.getBoundingClientRect();
+            if (rect.width < 100 || rect.y < 300 || rect.y > 1500) { debugInfo.skipped++; continue; }
+            if (processed.has(container)) { debugInfo.skipped++; continue; }
+            processed.add(container);
+            container.querySelectorAll('*').forEach(c => processed.add(c));
+
+            // 用 TreeWalker 提取文本
+            const texts = [];
+            const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+                acceptNode: (n) => {
+                    const t = n.textContent.trim();
+                    return t ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+                }
+            }, false);
+            let node;
+            while ((node = walker.nextNode())) texts.push(node.textContent.trim());
+
+            debugInfo.containers++;
+            if (debugInfo.containers <= 3) {
+                debugInfo[`container${debugInfo.containers}`] = texts.join(' | ').substring(0, 150);
+            }
+
+            const delIdx = texts.indexOf('删除');
+            if (delIdx < 2) continue;
+
+            // ========== 关键修复1: 跳过我们自己的回复(有"作者"标签) ==========
+            // 我们的回复: YioO有妖气 | 作者 | X分钟前 | @用户名 内容...
+            // 原始评论: 用户名 | X分钟前 | 内容 | 0 | 回复 | 删除 | 举报
+            const authorIdx = texts.indexOf('作者');
+            if (authorIdx >= 0 && authorIdx < delIdx) {
+                debugInfo.skipped++;
+                continue;
+            }
+
+            // 嵌套回复检测: 在"回复"按钮之后查找@用户名
+            // 正确结构: 用户名 | 时间 | 内容 | 0 | 回复 | 删除 | 举报
+            // 嵌套回复: 用户名 | 时间 | 内容 | @提及 | 0 | 回复 | 删除 | 举报
+            // @提及 在 "内容" 和 "回复" 之间
+            let replyBtnIdx = -1;
+            let atMention = null;
+            for (let i = delIdx - 1; i >= 0; i--) {
+                if (texts[i] === '回复') { replyBtnIdx = i; break; }
+            }
+            if (replyBtnIdx < 0) continue;
+
+            // 在"内容"和"回复"之间查找@用户名(嵌套回复标志)
+            for (let i = replyBtnIdx - 1; i >= 0; i--) {
+                if (texts[i].startsWith('@') && texts[i].length > 2) {
+                    atMention = texts[i].substring(1);
+                    break;
+                }
+                // 遇到时间/数字/内容就停止(说明不是嵌套回复)
+                if (timePattern.test(texts[i]) || pureNumberPattern.test(texts[i]) || texts[i] === '分钟前' || texts[i] === '小时前') break;
+            }
+            const isNested = atMention !== null;
+            let nestedTarget = atMention;
+
+            // ========== 关键修复2: 内容提取 - 在"回复"之前找 ==========
+            let contentIdx = -1;
+            // 从"回复"按钮往前找,跳过"0"、时间、UI关键词
+            let searchStart = replyBtnIdx - 1;
+            for (let i = searchStart; i >= 0; i--) {
+                if (filterKeywords.includes(texts[i])) continue;
+                if (timePattern.test(texts[i]) || pureNumberPattern.test(texts[i]) || texts[i] === '分钟前' || texts[i] === '小时前') continue;
+                // ========== 关键修复3: 跳过@开头的文本(嵌套回复的@提及不是内容) ==========
+                if (texts[i].startsWith('@') && texts[i].length > 2) continue;
+                contentIdx = i;
+                break;
+            }
+
+            // 🐾 v52修复: 表情评论处理(TreeWalker提取不到emoji时)。
+            let content = null;
+            if (contentIdx === -1) {
+                // 尝试从DOM提取emoji内容。
+                for (const el of container.querySelectorAll('*')) {
+                    const text = el.textContent.trim();
+                    if (texts.includes(text) || filterKeywords.includes(text)) continue;
+                    if (text.length > 0) {
+                        const hasVisibleText = /[\u4e00-\u9fff\u0800-\u4e00a-zA-Z0-9]/.test(text);
+                        if (!hasVisibleText) { content = text; break; }
+                    }
+                }
+                if (!content) content = '[表情]';
+            } else {
+                content = texts[contentIdx];
+                // 常规内容过滤。
+                if (content.includes(invisibleMark)) continue;
+                if (ourReplies.some(kw => content.includes(kw))) continue;
+                if (timePattern.test(content) || pureNumberPattern.test(content)) continue;
+                if (filterKeywords.some(kw => content === kw)) continue;
+                if (content.startsWith('@') && content.length > 3) continue;
+            }
+
+            let usernameIdx = -1;
+            // 表情评论(contentIdx=-1)从replyBtnIdx-1开始找用户名。
+            const usernameSearchStart = contentIdx === -1 ? replyBtnIdx - 1 : contentIdx - 1;
+            for (let i = usernameSearchStart; i >= 0; i--) {
+                if (filterKeywords.includes(texts[i])) continue;
+                if (timePattern.test(texts[i]) || texts[i] === '分钟前' || texts[i] === '小时前') continue;
+                // v21: 只过滤1-2位短数字(点赞数等),允许纯数字用户名(如12358)通过
+                if (/^\d{1,2}$/.test(texts[i])) continue;
+                usernameIdx = i;
+                break;
+            }
+            if (usernameIdx === -1) continue;
+            const username = texts[usernameIdx];
+            if (excludeUsers.includes(username)) continue;
+            if (username.length < 1 || username.length > 25) continue;
+            // v20.1: 允许纯数字用户名(如12358),只过滤明显是UI元素的短数字
+            if (/^\d{1,2}$/.test(username) && !/^(昨天|刚刚)/.test(texts[usernameIdx - 1] || '')) continue;
+            const uiKeywords2 = ['最新发布', '全部', '推荐', '热门', '我的', '设置', '管理', '内容管理'];
+            if (uiKeywords2.some(kw => username.includes(kw))) continue;
+            // v20.3: 修复ourReplyContents误杀 - 只精确匹配,不用startsWith
+            if (ourReplyContents.some(reply => {
+                for (const t of texts) {
+                    if (t === reply) return true;
+                }
+                return false;
+            })) continue;
+
+            const key = `${username}|${content.substring(0, 30)}`;
+            if (seenKeys.has(key)) continue;
+            seenKeys.add(key);
+
+            let replyBtnY = null;
+            for (const btn of container.querySelectorAll('*')) {
+                if (btn.textContent.trim() === '回复' && btn.offsetParent) {
+                    const r = btn.getBoundingClientRect();
+                    if (r.y > 300 && r.width > 0) { replyBtnY = Math.round(r.y); break; }
+                }
+            }
+            results.push({ username, content, key, replyBtnY, isNested, nestedTarget, debugTexts: texts.join(' | ') });
+        }
+        return { results, debugInfo };
+    }, excludeUsers, OUR_REPLIES, OUR_REPLY_CONTENTS, INVISIBLE_MARK);
+
+    log(`🔍 调试:删除按钮=${comments.debugInfo.deleteBtns}, 容器=${comments.debugInfo.containers}, 跳过=${comments.debugInfo.skipped}`);
+    if (comments.debugInfo.container1) log(`🔍 容器1: ${comments.debugInfo.container1}`);
+    if (comments.debugInfo.container2) log(`🔍 容器2: ${comments.debugInfo.container2}`);
+    if (comments.debugInfo.container3) log(`🔍 容器3: ${comments.debugInfo.container3}`);
+    return comments.results;
+};
+
+const checkComments = async (page) => {
+    log('\n💬 检查新评论...');
+    // 🐾 v45: 每次轮巡前刷新页面,防止 Chrome 后台休眠导致页面加载不完整
+    try {
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+        await randomDelay(1500, 2500);
+    } catch (e) {
+        log(`⚠️ 页面刷新超时,继续执行...`);
+    }
+    await page.goto('https://creator.douyin.com/creator-micro/interactive/comment', { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await randomDelay(CONFIG.HUMAN_DELAY.min, CONFIG.HUMAN_DELAY.max);
+
+    // 点击"全部"选项卡
+    try {
+        const allTabClicked = await page.evaluate(() => {
+            for (const el of document.querySelectorAll('*')) {
+                if (el.textContent.trim() === '全部' && el.offsetWidth > 20 && el.offsetHeight > 10) {
+                    el.click();
+                    return true;
+                }
+            }
+            return false;
+        });
+        if (allTabClicked) {
+            log('✅ 已点击"全部"选项卡');
+            await randomDelay(1500, 2500);
+        }
+    } catch (e) {}
+
+    const excludeUsers = [];
+
+    // ==================== 查找视频卡片选择器 ====================
+    const VIDEO_CARD_SELECTORS = [
+        '[class*="video-card"]',
+        '[class*="VideoCard"]',
+        '[class*="item-wrapper"]',
+        '[class*="card-item"]',
+        'li[class*="item"]',
+        '[class*="video-item"]',
+        'li.semi-list-item',
+    ];
+
+    // 探测可用的选择器 + 卡片数量
+    const { selector, count } = await page.evaluate((selectors) => {
+        for (const sel of selectors) {
+            const els = document.querySelectorAll(sel);
+            if (els.length > 0) return { selector: sel, count: els.length };
+        }
+        // 兜底:尝试找包含"删除"的独立区块
+        const blocks = new Set();
+        for (const el of document.querySelectorAll('*')) {
+            if (el.textContent.includes('删除')) {
+                const parent = el.closest('li, [class*="card"], [class*="item"], [class*="wrapper"]');
+                if (parent) blocks.add(parent.outerHTML.substring(0, 100));
+            }
+        }
+        return { selector: '', count: blocks.size || 1 };
+    }, VIDEO_CARD_SELECTORS);
+
+    if (!selector) {
+        log('⚠️ 未找到视频卡片选择器,尝试直接处理当前页评论');
+    } else {
+        log(`📹 检测到约 ${count} 个视频(选择器: ${selector})`);
+    }
+
+    const maxVideos = 1; // 只处理最新 1 条视频
+    const replied = loadReplied();
+    let totalNewReplied = 0;
+
+    // ==================== 逐个视频遍历 ====================
+    for (let vi = 0; vi < maxVideos; vi++) {
+        log(`\n🎬 处理第 ${vi + 1} 个视频...`);
+
+        // 点击视频卡片(第 1 个视频已经在当前页,不用点)
+        if (vi > 0) {
+            const clicked = await page.evaluate(({ sel, idx }) => {
+                if (!sel) return false;
+                const els = document.querySelectorAll(sel);
+                if (els.length > idx) {
+                    els[idx].scrollIntoView({ block: 'center' });
+                    els[idx].click();
+                    return true;
+                }
+                return false;
+            }, { sel: selector, idx: vi });
+
+            if (!clicked) {
+                log(`⚠️ 未能切换到第 ${vi + 1} 个视频卡片,跳过`);
+                continue;
+            }
+            await randomDelay(2000, 3000);
+        }
+
+        // 🐾 v42: 缓慢滚动评论列表,确保全部评论加载完成
+        log('🔄 v42 滚动加载评论...');
+        await humanScroll(page);
+        await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'smooth' }));
+        await randomDelay(1000, 1500);
+
+        // 提取当前视频全部评论
+        const comments = await extractCommentsFromPage(page, excludeUsers);
+        log(`📝 视频${vi + 1} 检测到 ${comments.length} 条评论`);
+
+        if (comments.length === 0) {
+            log('i️ 暂无评论');
+            continue;
+        }
+
+        // 🐾 v43.0: 方案一 - 每回复一条后刷新页面重新收集评论
+        // 去重: 同一评论可能在 DOM 中渲染多次, 只保留第一条
+        const uniqueComments = [];
+        const seenInRun = new Set();
+        for (const c of comments) {
+            if (!seenInRun.has(c.key)) {
+                seenInRun.add(c.key);
+                uniqueComments.push(c);
+            }
+        }
+        if (uniqueComments.length < comments.length) {
+            log();
+        }
+
+        let repliedThisRun = 0;
+        let consecutiveFailures = 0; // 🐾 v25: 连续失败计数器
+        const failedKeys = new Set(); // 🐾 v43: 记录本轮失败的评论,避免无限重试
+
+        // 🐾 v42: 检查每日回复上限
+        if (isDailyLimitReached()) {
+            log(`🛑 v42 今日回复已达上限 (${getTodayReplyCount()}/${CONFIG.DAILY_REPLY_LIMIT}),跳过本轮回复`);
+            return;
+        }
+
+        // 🐾 v43.0: 逐条回复 + 刷新页面 + 重新收集评论
+        while (true) {
+            // 本轮回复上限
+            if (repliedThisRun >= CONFIG.MAX_REPLIES_PER_RUN) {
+                log(`🐾 本轮已达回复上限 (${CONFIG.MAX_REPLIES_PER_RUN} 条),剩余评论下次处理`);
+                break;
+            }
+
+            // 🐾 重新收集评论(第一轮用已有数据,后续刷新后重新收集)
+            let targetComment = null;
+            if (repliedThisRun === 0 && uniqueComments.length > 0) {
+                // 第一轮:直接用已收集的评论
+                for (const c of uniqueComments) {
+                    if (c.username && c.content && c.key && !replied.comments.includes(c.key) && !failedKeys.has(c.key)) {
+                        targetComment = c;
+                        break;
+                    }
+                }
+            } else if (repliedThisRun > 0) {
+                // 刷新页面后重新收集评论
+                log('🔄 v43 刷新页面,重新收集评论...');
+                await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
+                await randomDelay(3000, 5000); // 等页面稳定
+                // 重新滚动加载评论
+                await humanScroll(page);
+                await page.evaluate(() => window.scrollTo({ top: 0, behavior: 'smooth' }));
+                await randomDelay(1000, 1500);
+                // 重新提取评论
+                const freshComments = await extractCommentsFromPage(page, excludeUsers);
+                log(`📝 v43 刷新后检测到 ${freshComments.length} 条评论`);
+                // 找第一条未回复的
+                for (const c of freshComments) {
+                    if (c.username && c.content && c.key && !replied.comments.includes(c.key) && !failedKeys.has(c.key)) {
+                        targetComment = c;
+                        break;
+                    }
+                }
+            }
+
+            // 没有未回复的评论了
+            if (!targetComment) {
+                log('✅ 所有评论已回复完毕');
+                break;
+            }
+
+            const comment = targetComment;
+
+            // 调试:打印完整 DOM 文本结构
+            if (comment.debugTexts) {
+                log(`🔍 DOM文本: ${comment.debugTexts.substring(0, 200)}`);
+            }
+
+            log('📌 步骤:缓存检查通过');
+            log('📌 步骤:跳过检查通过');
+
+            // 确保没有打开的回复框
+            try {
+            await page.keyboard.press('Escape');
+            await randomDelay(300, 500);
+            // 点击左侧空白区域取消焦点(不用 humanClick,避免卡死)
+            await page.mouse.click(80 + Math.random() * 40, 550 + Math.random() * 100);
+            await randomDelay(300, 500);
+            } catch(e) { log(`⚠️ 预处理异常:${e.message}`); continue; }
+
+            // 嵌套回复标记
+            const nestedInfo = comment.isNested ? ` [嵌套回复${comment.nestedTarget ? '@' + comment.nestedTarget : ''}]` : '';
+            log(`👤 新评论 [${comment.username}]: ${comment.content.substring(0, 40)}${nestedInfo}`);
+
+            const reply = await generateReply(comment.content);
+            // 嵌套回复:抖音会自动@对方,不需要手动加@前缀
+            let replyText = reply; // v36.1: 改为 let 以允许拦截机制修改内容
+            // 🔥 v36.0: 发送前最后一道防线 - 强制清洗 undefined
+            if (!replyText || typeof replyText !== 'string' || replyText.toLowerCase().includes("undefined")) {
+                log(`⚠️ 【终极拦截】回复内容异常 (${replyText}),强制重置为兜底回复`);
+                replyText = "谢谢宝的支持呀~有空常来玩💃" + INVISIBLE_MARK;
+            }
+            log(`🤖 AI: ${replyText.substring(0, 50)}...`);
+
+            // ===== v16.1: 一气呵成找按钮→滚动→点击 =====
+            const clickReplyBtn = await page.evaluate((targetUser, targetContent) => {
+                const timePattern = /^(\d+(分钟前|小时前|天前)|刚刚|昨天)/;
+                const pureNumberPattern = /^\d+$/;
+                const filterKeywords = ['作者', '回复', '删除', '举报', '去发布作品', '发送', '置顶已读删除', '全部', '最新', '热门', '推荐', '管理'];
+
+                // 找"删除"按钮
+                const delBtns = [];
+                for (const el of document.querySelectorAll('*')) {
+                    if (el.textContent.trim() === '删除') {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0 && rect.y > 200) {
+                            delBtns.push(el);
+                        }
+                    }
+                }
+
+                for (const delBtn of delBtns) {
+                    // 🐾 v21策略1: 快速定位到含1个"删除"+"回复"的容器
+                    let container = delBtn.parentElement;
+                    while (container) {
+                        const text = container.textContent || '';
+                        const delCount = (text.match(/删除/g) || []).length;
+                        if (delCount === 1 && text.includes('回复')) {
+                            const parent = container.parentElement;
+                            if (parent) {
+                                const parentDelCount = (parent.textContent.match(/删除/g) || []).length;
+                                if (parentDelCount === 1) {
+                                    container = parent;
+                                    continue;
+                                }
+                            }
+                            break;
+                        }
+                        if (!container.parentElement) break;
+                        container = container.parentElement;
+                    }
+                    if (!container) continue;
+
+                    // 🐾 v21策略2: 候选收集+最小选择,精确定位评论项容器
+                    const candidates = [];
+                    let c = delBtn.parentElement;
+                    let depth = 0;
+                    while (c && depth < 10) {
+                        const cText = c.textContent || '';
+                        const cDelCount = (cText.match(/删除/g) || []).length;
+                        if (cDelCount === 1 && cText.includes('回复')) {
+                            const cRect = c.getBoundingClientRect();
+                            if (cRect.height >= 60 && cRect.height <= 400 && cRect.width > 100) {
+                                candidates.push({ el: c, area: cRect.width * cRect.height });
+                            }
+                        }
+                        c = c.parentElement;
+                        depth++;
+                    }
+                    if (candidates.length > 0) {
+                        candidates.sort((a, b) => a.area - b.area);
+                        container = candidates[0].el;
+                    }
+                    if (!container) continue;
+
+                    const finalText = container.textContent || '';
+                    if ((finalText.match(/删除/g) || []).length !== 1) continue;
+                    const rect = container.getBoundingClientRect();
+                    if (rect.width < 100 || rect.y < 200) continue;
+
+                    const texts = [];
+                    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+                        acceptNode: (n) => {
+                            const t = n.textContent.trim();
+                            return t ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+                        }
+                    }, false);
+                    let node;
+                    while ((node = walker.nextNode())) texts.push(node.textContent.trim());
+
+                    const delIdx = texts.indexOf('删除');
+                    if (delIdx < 2) continue;
+
+                    const authorIdx = texts.indexOf('作者');
+                    if (authorIdx >= 0 && authorIdx < delIdx) continue;
+
+                    let replyBtnIdx = -1;
+                    for (let i = delIdx - 1; i >= 0; i--) {
+                        if (texts[i] === '回复') { replyBtnIdx = i; break; }
+                    }
+                    if (replyBtnIdx < 0) continue;
+
+                    let contentIdx = -1;
+                    for (let i = replyBtnIdx - 1; i >= 0; i--) {
+                        if (filterKeywords.includes(texts[i])) continue;
+                        if (timePattern.test(texts[i]) || texts[i] === '分钟前' || texts[i] === '小时前') continue;
+                        if (/^\d{1,2}$/.test(texts[i])) continue;
+                        if (texts[i].startsWith('@') && texts[i].length > 2) continue;
+                        contentIdx = i;
+                        break;
+                    }
+                    if (contentIdx < 0) continue;
+                    const content = texts[contentIdx];
+
+                    let usernameIdx = -1;
+                    for (let i = contentIdx - 1; i >= 0; i--) {
+                        if (filterKeywords.includes(texts[i])) continue;
+                        if (timePattern.test(texts[i]) || texts[i] === '分钟前' || texts[i] === '小时前') continue;
+                        // v21: 只过滤1-2位短数字,允许纯数字用户名(如12358)
+                        if (/^\d{1,2}$/.test(texts[i])) continue;
+                        usernameIdx = i;
+                        break;
+                    }
+                    if (usernameIdx < 0) continue;
+                    const username = texts[usernameIdx];
+
+                    // 匹配目标评论
+                    if (username === targetUser && content.includes(targetContent.substring(0, 15))) {
+                        // 找到匹配的回复按钮,一气呵成:滚动→dispatchEvent点击
+                        for (const btn of container.querySelectorAll('*')) {
+                            if (btn.textContent.trim() === '回复' && btn.offsetParent) {
+                                const r = btn.getBoundingClientRect();
+                                if (r.y > 200 && r.width > 0) {
+                                    // 🐾 v38.0: 滚动居中 + 异步等待页面稳定 + 重新获取坐标点击
+                                    btn.scrollIntoView({ block: 'center' });
+                                    // 使用 Promise 等待页面滚动到位
+                                    return new Promise(resolve => {
+                                        setTimeout(() => {
+                                            // 滚动后重新获取坐标,防止位置偏移
+                                            const newR = btn.getBoundingClientRect();
+                                            // 模拟真人点击:mousedown -> mouseup -> click
+                                            btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: newR.left + newR.width/2, clientY: newR.top + newR.height/2 }));
+                                            btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                                            btn.click();
+                                            resolve({ ok: true, y: Math.round(newR.y) });
+                                        }, 1200); // 等待 1.2 秒让页面滚完
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                return { ok: false };
+            }, comment.username, comment.content);
+
+            if (!clickReplyBtn.ok) {
+                log(`⚠️ 未找到回复按钮(v16.1) [${comment.key}],跳过`);
+                failedKeys.add(comment.key); // 🐾 v43: 标记为失败,避免刷新后重试同一条
+                continue;
+            }
+            log(`✅ 已点击回复按钮(y=${clickReplyBtn.y})`);
+            await randomDelay(800, 1200);
+
+            // 🐾 v21: 等待嵌套回复面板出现(验证输入框在回复按钮附近,不是全局输入框)
+            const replyBtnY = clickReplyBtn.y;
+            let inputVisible = false;
+            let nestedInputY = null;
+            // 🐾 v26加固: 增加轮询次数从10到16,总等待时间从6秒到约10秒
+            for (let i = 0; i < 16; i++) {
+                const checkResult = await page.evaluate((btnY) => {
+                    // 条件1: contenteditable输入框(主要检测)
+                    for (const div of document.querySelectorAll('[contenteditable="true"]')) {
+                        const r = div.getBoundingClientRect();
+                        if (r.width < 50 || r.height < 10) continue;
+                        // 关键:嵌套输入框必须在回复按钮附近(上下300px范围内)
+                        // 全局输入框在页面底部(y>800),远离回复按钮
+                        const distY = Math.abs(r.y - btnY);
+                        if (distY > 300) continue;
+                        // 额外验证:父级包含"取消+发送"
+                        let parent = div.parentElement;
+                        let depth = 0;
+                        while (parent && parent.tagName !== 'BODY' && depth < 30) {
+                            const pText = parent.textContent || '';
+                            if (pText.includes('取消') && pText.includes('发送')) {
+                                return { ok: true, y: Math.round(r.y) };
+                            }
+                            parent = parent.parentElement;
+                            depth++;
+                        }
+                    }
+                    // 条件2: textarea输入框(备用,部分抖音版本用textarea)
+                    for (const ta of document.querySelectorAll('textarea')) {
+                        const r = ta.getBoundingClientRect();
+                        if (r.width < 50 || r.height < 15) continue;
+                        const distY = Math.abs(r.y - btnY);
+                        if (distY > 300) continue;
+                        let parent = ta.parentElement;
+                        let depth = 0;
+                        while (parent && parent.tagName !== 'BODY' && depth < 30) {
+                            const pText = parent.textContent || '';
+                            if (pText.includes('取消') && pText.includes('发送')) {
+                                return { ok: true, y: Math.round(r.y) };
+                            }
+                            parent = parent.parentElement;
+                            depth++;
+                        }
+                    }
+                    return { ok: false };
+                }, replyBtnY);
+                if (checkResult.ok) { inputVisible = true; nestedInputY = checkResult.y; break; }
+                await randomDelay(500, 600);
+            }
+
+            if (!inputVisible) {
+                log(`⚠️ 等待嵌套输入框超时(回复按钮y=${replyBtnY}),跳过 [${comment.key}]`);
+                await page.keyboard.press('Escape');
+                continue;
+            }
+            log(`✅ 嵌套回复面板已打开(输入框y=${nestedInputY}, 距回复按钮${Math.abs(nestedInputY - replyBtnY)}px)`);
+
+            // 🐾 v25加固: 增加面板初始化等待,确保React内部状态就绪
+            await new Promise(r => setTimeout(r, 1500));
+
+            // 🐾 v26: 找嵌套输入框坐标并点击聚焦(contenteditable + textarea双检测)
+            const inputRect = await page.evaluate((btnY) => {
+                // 优先找contenteditable
+                for (const div of document.querySelectorAll('[contenteditable="true"]')) {
+                    const r = div.getBoundingClientRect();
+                    if (r.width < 50) continue;
+                    if (Math.abs(r.y - btnY) > 300) continue;
+                    let parent = div.parentElement;
+                    let depth = 0;
+                    while (parent && parent.tagName !== 'BODY') {
+                        depth++;
+                        const pText = parent.textContent || '';
+                        if (pText.includes('取消') && pText.includes('发送')) {
+                            return { x: r.x + r.width/2, y: r.y + r.height/2 };
+                        }
+                        if (depth > 30) break;
+                        parent = parent.parentElement;
+                    }
+                }
+                // 备用:textarea
+                for (const ta of document.querySelectorAll('textarea')) {
+                    const r = ta.getBoundingClientRect();
+                    if (r.width < 50 || r.height < 15) continue;
+                    if (Math.abs(r.y - btnY) > 300) continue;
+                    let parent = ta.parentElement;
+                    let depth = 0;
+                    while (parent && parent.tagName !== 'BODY') {
+                        depth++;
+                        const pText = parent.textContent || '';
+                        if (pText.includes('取消') && pText.includes('发送')) {
+                            return { x: r.x + r.width/2, y: r.y + r.height/2 };
+                        }
+                        if (depth > 30) break;
+                        parent = parent.parentElement;
+                    }
+                }
+                return null;
+            }, replyBtnY);
+
+            if (!inputRect) {
+                log(`⚠️ 未找到嵌套输入框,跳过 [${comment.key}]`);
+                await page.keyboard.press('Escape');
+                continue;
+            }
+
+            // 点击输入框使其聚焦
+            await page.mouse.click(inputRect.x, inputRect.y);
+            await randomDelay(500, 800);
+
+            // 🐾 v43.1: 改用 page.evaluate 直接注入文本 + 触发 input 事件(CDP 打字不被 React 识别)
+            log('🔄 注入回复文本(' + replyText.length + '字符)...');
+
+            const injectResult = await page.evaluate((btnY, text) => {
+                let targetDiv = null;
+                let bestDist = Infinity;
+
+                for (const div of document.querySelectorAll('[contenteditable="true"]')) {
+                    const r = div.getBoundingClientRect();
+                    if (r.width < 50 || r.height < 10) continue;
+                    if (r.y <= btnY) continue;
+
+                    let parent = div.parentElement;
+                    let hasCancel = false, hasSend = false, depth = 0;
+                    while (parent && parent.tagName !== 'BODY' && depth < 10) {
+                        const pText = parent.textContent || '';
+                        if (pText.includes('取消')) hasCancel = true;
+                        if (pText.includes('发送')) hasSend = true;
+                        if (hasCancel && hasSend) break;
+                        parent = parent.parentElement;
+                        depth++;
+                    }
+
+                    const dist = r.y - btnY;
+                    if (hasCancel && hasSend && dist < bestDist) {
+                        targetDiv = div;
+                        bestDist = dist;
+                    }
+                }
+
+                if (!targetDiv) return { ok: false, reason: '找不到输入框' };
+
+                targetDiv.focus();
+                targetDiv.innerText = text;
+
+                const inputEvent = new Event('input', { bubbles: true });
+                targetDiv.dispatchEvent(inputEvent);
+                targetDiv.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true }));
+                targetDiv.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+
+                return new Promise(resolve => {
+                    setTimeout(() => {
+                        for (const btn of document.querySelectorAll('button')) {
+                            if (btn.textContent.trim() === '发送' && btn.offsetParent && !btn.disabled) {
+                                const br = btn.getBoundingClientRect();
+                                resolve({
+                                    ok: true,
+                                    btnX: Math.round(br.x + br.width / 2),
+                                    btnY: Math.round(br.y + br.height / 2),
+                                    btnW: Math.round(br.width),
+                                    btnH: Math.round(br.height),
+                                    injectedLength: text.length
+                                });
+                                return;
+                            }
+                        }
+                        resolve({ ok: false, reason: '发送按钮仍为 disabled' });
+                    }, 500);
+                });
+            }, replyBtnY, replyText);
+
+            if (!injectResult.ok) {
+                log('⚠️ 文本注入失败: ' + (injectResult.reason || '未知原因') + ',跳过 [' + comment.key + ']');
+                await page.keyboard.press('Escape');
+                await randomDelay(300, 500);
+                failedKeys.add(comment.key);
+                continue;
+            }
+            log('✅ 文本注入成功(' + injectResult.injectedLength + '字符), 发送按钮 (' + injectResult.btnX + ',' + injectResult.btnY + ')');
+
+            // 🐾 v44: dispatchEvent 直接触发发送按钮,无视屏幕遮挡(修复底部评论发送失败)
+            const sendClickOk = await page.evaluate(() => {
+                for (const btn of document.querySelectorAll('button')) {
+                    if (btn.textContent.trim() === '发送' && btn.offsetParent && !btn.disabled) {
+                        btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                        btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                        btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                        return true;
+                    }
+                }
+                return false;
+            });
+            if (!sendClickOk) {
+                log('⚠️ dispatchEvent 点击发送按钮失败, 回退到鼠标点击 [' + comment.key + ']');
+                await randomDelay(300, 500);
+                await page.mouse.move(injectResult.btnX, injectResult.btnY, { steps: 10 });
+                await randomDelay(200, 400);
+                await page.mouse.click(injectResult.btnX, injectResult.btnY);
+            }
+            await randomDelay(2000, 3000);
+
+// 🐾 v22: 检测验证码弹窗
+            await randomDelay(2000, 3000);
+            const captchaCheck = await page.evaluate(() => {
+                const bodyText = document.body.innerText;
+                const captchaKeywords = ['验证码', '滑块', '拖动', '安全验证', '请完成', '确认', '拼图', '拼图验证', '滑动', '验证'];
+                for (const kw of captchaKeywords) {
+                    if (bodyText.includes(kw)) return { hasCaptcha: true, keyword: kw };
+                }
+                // 额外检查: 是否有模态对话框
+                for (const el of document.querySelectorAll('[class*="modal"], [class*="dialog"], [class*="captcha"], [class*="verify"], [class*="slide"]')) {
+                    if (el.offsetParent && el.offsetWidth > 100) return { hasCaptcha: true, keyword: 'modal' };
+                }
+                return { hasCaptcha: false };
+            });
+
+            if (captchaCheck.hasCaptcha) {
+                log(`⚠️ 检测到验证码弹窗(${captchaCheck.keyword}),暂停等待主人操作...`);
+                // 写入等待文件
+                fs.writeFileSync('/tmp/douyin_captcha_wait', 'waiting');
+                log('💤 等待主人完成验证...');
+
+                // 轮询等待主人完成验证(最多等5分钟)
+                let maxWait = 300; // 5分钟
+                let waited = 0;
+                while (waited < maxWait) {
+                    await sleep(3000);
+                    waited += 3;
+                    const stillCaptcha = await page.evaluate(() => {
+                        const bodyText = document.body.innerText;
+                        const captchaKeywords = ['验证码', '滑块', '拖动', '安全验证', '请完成', '确认', '拼图', '拼图验证', '滑动', '验证'];
+                        for (const kw of captchaKeywords) {
+                            if (bodyText.includes(kw)) return true;
+                        }
+                        return false;
+                    });
+                    if (!stillCaptcha) {
+                        log('✅ 主人完成验证!继续发送...');
+                        fs.writeFileSync('/tmp/douyin_captcha_wait', 'done');
+                        break;
+                    }
+                }
+
+                if (waited >= maxWait) {
+                    log('⏱️ 等待超时,跳过此条评论');
+                    fs.writeFileSync('/tmp/douyin_captcha_wait', 'timeout');
+                    await page.keyboard.press('Escape');
+                    await randomDelay(300, 500);
+                    await page.keyboard.press('Escape');
+                    continue;
+                }
+
+                // 验证完成后,重新发送(dispatchEvent + 鼠标回退)
+                log('🔄 重新发送按钮...');
+                const captchaSendOk = await page.evaluate(() => {
+                    for (const btn of document.querySelectorAll('button')) {
+                        if (btn.textContent.trim() === '发送' && btn.offsetParent && !btn.disabled) {
+                            btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                            btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                            btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                            return true;
+                        }
+                    }
+                    return false;
+                });
+                if (!captchaSendOk) {
+                    log('⚠️ dispatchEvent 失败, 回退到鼠标点击');
+                    await page.mouse.click(sendBtnRect.x, sendBtnRect.y);
+                }
+                await randomDelay(2000, 3000);
+            }
+
+            // v23: 等待发送处理完成(增加等待时间确保React状态更新)
+            await randomDelay(3000, 4000);
+
+            // v16.3: 发送后验证(防止"假发送")
+            await randomDelay(2000, 2500);
+            let sendVerified = false;
+            let maxRetries = 2;
+
+            // v18: 重试用CDP keyboard
+            for (let retry = 0; retry < maxRetries; retry++) {
+                if (retry > 0) {
+                    log(`🔄 发送验证失败,第${retry}次重试...`);
+
+                    // v22: 重试前也检查验证码
+                    const retryCaptcha = await page.evaluate(() => {
+                        const bodyText = document.body.innerText;
+                        const captchaKeywords = ['验证码', '滑块', '拖动', '安全验证', '请完成', '确认', '拼图', '拼图验证', '滑动'];
+                        for (const kw of captchaKeywords) {
+                            if (bodyText.includes(kw)) return { hasCaptcha: true, keyword: kw };
+                        }
+                        return { hasCaptcha: false };
+                    });
+
+                    if (retryCaptcha.hasCaptcha) {
+                        log(`⚠️ 重试时检测到验证码(${retryCaptcha.keyword}),暂停等待主人...`);
+                        fs.writeFileSync('/tmp/douyin_captcha_wait', 'waiting');
+                        let maxWait = 300;
+                        let waited = 0;
+                        while (waited < maxWait) {
+                            await sleep(3000);
+                            waited += 3;
+                            const stillCaptcha = await page.evaluate(() => {
+                                const bodyText = document.body.innerText;
+                                const captchaKeywords = ['验证码', '滑块', '拖动', '安全验证', '请完成', '确认', '拼图', '拼图验证', '滑动'];
+                                for (const kw of captchaKeywords) {
+                                    if (bodyText.includes(kw)) return true;
+                                }
+                                return false;
+                            });
+                            if (!stillCaptcha) {
+                                log('✅ 主人完成验证!继续重试...');
+                                fs.writeFileSync('/tmp/douyin_captcha_wait', 'done');
+                                break;
+                            }
+                        }
+                        if (waited >= maxWait) {
+                            log('⏱️ 等待超时,跳过');
+                            fs.writeFileSync('/tmp/douyin_captcha_wait', 'timeout');
+                            break;
+                        }
+                    }
+
+                    // 🐾 v26: 重新找输入框并聚焦(contenteditable + textarea双检测)
+                    const retryInputRect = await page.evaluate((btnY) => {
+                        for (const div of document.querySelectorAll('[contenteditable="true"]')) {
+                            const r = div.getBoundingClientRect();
+                            if (r.width > 50 && Math.abs(r.y - btnY) <= 300) {
+                                let parent = div.parentElement;
+                                while (parent && parent.tagName !== 'BODY') {
+                                    if (parent.textContent.includes('取消') && parent.textContent.includes('发送')) {
+                                        return { x: r.x + r.width/2, y: r.y + r.height/2 };
+                                    }
+                                    parent = parent.parentElement;
+                                }
+                            }
+                        }
+                        // 备用:textarea
+                        for (const ta of document.querySelectorAll('textarea')) {
+                            const r = ta.getBoundingClientRect();
+                            if (r.width > 50 && r.height > 15 && Math.abs(r.y - btnY) <= 300) {
+                                let parent = ta.parentElement;
+                                while (parent && parent.tagName !== 'BODY') {
+                                    if (parent.textContent.includes('取消') && parent.textContent.includes('发送')) {
+                                        return { x: r.x + r.width/2, y: r.y + r.height/2 };
+                                    }
+                                    parent = parent.parentElement;
+                                }
+                            }
+                        }
+                        return null;
+                    }, replyBtnY);
+                    if (!retryInputRect) {
+                        log(`⚠️ 重试未找到输入框,放弃 [${comment.key}]`);
+                        break;
+                    }
+                    await page.mouse.click(retryInputRect.x, retryInputRect.y);
+                    await randomDelay(500, 800);
+
+                    // 🐾 v23: 重试也用 page.keyboard.type
+                    await page.keyboard.type(replyText, { delay: 30 });
+                    await randomDelay(1000, 1500);
+
+                    // 找嵌套回复的发送按钮(限定在回复按钮附近)
+                    const retrySendBtnRect = await page.evaluate((btnY) => {
+                        for (const el of document.querySelectorAll('*')) {
+                            const etext = el.textContent || '';
+                            if (etext.includes('取消') && etext.includes('发送')) {
+                                const r = el.getBoundingClientRect();
+                                if (Math.abs(r.y - btnY) > 300) continue;
+                                for (const btn of el.querySelectorAll('button')) {
+                                    if (btn.textContent.trim() === '发送') {
+                                        const br = btn.getBoundingClientRect();
+                                        return { x: br.x + br.width/2, y: br.y + br.height/2 };
+                                    }
+                                }
+                            }
+                        }
+                        return null;
+                    }, replyBtnY);
+
+                    if (!retrySendBtnRect) {
+                        log(`⚠️ 重试未找到发送按钮,放弃 [${comment.key}]`);
+                        break;
+                    }
+
+                    // 🐾 v44: 重试也用 dispatchEvent 完整事件链点击 + 鼠标回退(无视遮挡)
+                    const retrySendOk = await page.evaluate(() => {
+                        for (const btn of document.querySelectorAll('button')) {
+                            if (btn.textContent.trim() === '发送' && btn.offsetParent && !btn.disabled) {
+                                btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                                btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                                btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                                return true;
+                            }
+                        }
+                        return false;
+                    });
+
+                    if (!retrySendOk) {
+                        log(`⚠️ dispatchEvent 失败, 回退到鼠标点击 [${comment.key}]`);
+                        await page.mouse.move(retrySendBtnRect.x, retrySendBtnRect.y, { steps: 10 });
+                        await randomDelay(200, 400);
+                        await page.mouse.click(retrySendBtnRect.x, retrySendBtnRect.y);
+                    }
+
+                    await randomDelay(3000, 4000);
+                }
+
+                // v23: 验证发送是否成功
+                const verifyResult = await page.evaluate((btnY, replyText) => {
+                    const allElements = document.querySelectorAll('*');
+                    const bodyText = document.body.innerText;
+
+                    // 条件1: "发送成功"toast 出现(最可靠)
+                    if (bodyText.includes('发送成功') || bodyText.includes('评论成功')) {
+                        return { success: true, method: 'toast shown' };
+                    }
+
+                    // 条件2: 检查嵌套回复面板是否已关闭
+                    let panelStillOpen = false;
+                    for (const el of allElements) {
+                        const etext = el.textContent || '';
+                        if (etext.includes('取消') && etext.includes('发送') && el.offsetWidth > 50) {
+                            const r = el.getBoundingClientRect();
+                            if (Math.abs(r.y - btnY) <= 300 && r.width > 0) {
+                                panelStillOpen = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // 条件3: 回复文本出现在页面上(任何位置)
+                    const searchLen = Math.min(10, replyText.length);
+                    const searchPrefix = replyText.substring(0, searchLen);
+                    const replyTextOnPage = bodyText.includes(searchPrefix);
+
+                    // 面板关闭 + 回复文本在页面上 = 发送成功
+                    if (!panelStillOpen && replyTextOnPage) {
+                        return { success: true, method: 'panel closed + text on page' };
+                    }
+
+                    // 仅面板关闭也可信(发送按钮被点击且面板自动关闭)
+                    if (!panelStillOpen) {
+                        return { success: true, method: 'panel closed' };
+                    }
+
+                    // 回复文本在页面上但面板还开着 → 不算成功(文字可能还在输入框里)
+                    // 放宽判定:面板关闭 + 页面有回复文本才算成功
+                    return { success: false, method: 'panel still open (text on page)', panelStillOpen: true };
+                }, replyBtnY, replyText);
+
+                if (verifyResult.success) {
+                    sendVerified = true;
+                    log(`✅ 发送验证通过 (方法: ${verifyResult.method})`);
+
+                    // 🐾 v22: 发送成功后确保关闭嵌套回复面板
+                    // 如果面板还开着,按 Escape 关闭
+                    if (verifyResult.method !== 'panel closed') {
+                        await page.keyboard.press('Escape');
+                        await randomDelay(300, 500);
+                        await page.keyboard.press('Escape');
+                        await randomDelay(300, 500);
+                    }
+
+                    break;
+                } else {
+                    log(`⚠️ 发送验证失败: ${verifyResult.method}`);
+                }
+            }
+
+            if (!sendVerified) {
+                log(`❌ 发送最终失败: 重试${maxRetries}次后仍未验证通过,跳过 [${comment.key}]`);
+                consecutiveFailures++; // 🐾 v25: 连续失败计数
+                log(`⚠️ 连续失败次数: ${consecutiveFailures}/${CONFIG.CONSECUTIVE_FAILURE_LIMIT}`);
+                // 关闭回复面板后继续处理下一个
+                for (let i = 0; i < 3; i++) {
+                    await page.keyboard.press('Escape');
+                    await randomDelay(300, 500);
+                }
+                await page.mouse.click(50, 500);
+                await randomDelay(300, 500);
+
+                // 🐾 v25加固: 连续失败达到上限,暂停本轮
+                if (consecutiveFailures >= CONFIG.CONSECUTIVE_FAILURE_LIMIT) {
+                    log(`🛑 v25连续失败${consecutiveFailures}次,暂停本轮剩余回复,等待下一轮轮巡`);
+                    break; // 跳出回复循环,进入下一轮
+                }
+                continue;
+            }
+
+            log(`✅ 回复已发送(${replyText.length}字符),写入缓存 [${comment.key}]`);
+            // 🐾 v74: 记录本轮详情供报告使用
+            __lastResults.comments.push({ user: comment.username, content: comment.content.substring(0, 50), reply: replyText.substring(0, 50) });
+            replied.comments.push(comment.key);
+            saveReplied(replied);
+            totalNewReplied++;
+            repliedThisRun++; // 🐾 本轮回复计数
+            consecutiveFailures = 0; // 🐾 v25: 成功后重置连续失败计数
+            incrementDailyCount(); // 🐾 v42: 每日计数
+
+            // 🐾 v43.0: 回复一条后刷新页面重新收集评论
+            // 关闭回复框
+            for (let i = 0; i < 3; i++) {
+                await page.keyboard.press('Escape');
+                await randomDelay(300, 500);
+            }
+            await page.mouse.click(50, 500);
+            await randomDelay(300, 500);
+
+            // 🐾 v43.0: 短暂延迟后刷新页面(替代原来 60-180 秒等待)
+            const shortDelay = 15000 + Math.random() * 15000; // 15-30 秒
+            log(`💤 v43 刷新前等待 ${(shortDelay/1000).toFixed(0)}s...`);
+            await new Promise(r => setTimeout(r, shortDelay));
+            // 继续 while 循环,会自动刷新页面并重新收集评论
+            continue;
+        }
+
+        // 🐾 v43: 视频处理完毕后,停留一下再进入下一个视频(如有)
+        const stayTime = 10000 + Math.random() * 20000;
+        log(`💤 v43 视频处理完毕,停留 ${(stayTime/1000).toFixed(0)}s...`);
+        await new Promise(r => setTimeout(r, stayTime));
+        log(`✅ 视频${vi + 1} 处理完毕`);
+    }
+
+    log(`\n📊 评论检查完毕: 共处理 ${maxVideos} 个视频, 新回复 ${totalNewReplied} 条`);
+    return totalNewReplied;
+};
+
+// ==================== 私信检查 ====================
+
+// ==================== 检查并回复私信 ====================
+const checkDMs = async (page) => {
+    log('\n📩 检查新私信...');
+    // 🐾 v46: 先跳转再刷新,确保私信列表数据同步(解决列表加载超时问题)
+    try {
+        await page.goto('https://creator.douyin.com/creator-micro/data/following/chat', { waitUntil: 'networkidle2', timeout: 30000 });
+        await new Promise(r => setTimeout(r, 2000));
+        await page.reload({ waitUntil: 'networkidle2', timeout: 30000 });
+        await new Promise(r => setTimeout(r, 5000)); // 刷新后等5秒确保数据加载完毕
+    } catch (e) {
+        log(`⚠️ 页面刷新异常: ${e.message}`);
+    }
+
+    const hasNoDMs = await page.evaluate(() => document.body.innerText.includes('还没有收到私信'));
+    if (hasNoDMs) { log('i️ 暂无新私信'); return 0; }
+
+    // v21: 扫描指定tab的私信列表(滚动扫描,覆盖多页消息)
+    const scanDmTab = async (tabName) => {
+        // 切换到目标tab
+        await page.evaluate((name) => {
+            for (const tab of document.querySelectorAll('.semi-tabs-tab, [class*="tab"]')) {
+                if (tab.textContent.trim() === name) {
+                    tab.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                    tab.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                    tab.click();
+                    return;
+                }
+            }
+        }, tabName);
+        await randomDelay(1500, 2500); // 初始短暂等待
+
+        // v21: 提取当前可见私信的函数
+        const extractDmItems = async () => {
+            return await page.evaluate((ourKeywords, ourRepliedContents, invisibleMark, tabName) => {
+                // 🐾 v48: 多选择器兼容,按优先级尝试不同DOM结构(适配抖音改版)
+                let items = document.querySelectorAll('li.semi-list-item');
+                if (items.length === 0) items = document.querySelectorAll('div[role="gridcell"]');
+                if (items.length === 0) items = document.querySelectorAll('[class*="chat-item"]');
+                const results = [];
+                for (let i = 0; i < items.length; i++) {
+                    const item = items[i];
+                    const text = item.textContent.trim();
+                    const rect = item.getBoundingClientRect();
+
+                    // 🐾 v60: 放宽可见性检查 - 虚拟列表元素未滚动到视口时 rect.w/h=0 是正常的
+                    // 只过滤完全空白的元素(text 长度太短)
+                    if (text.length < 5) continue;
+
+                    // 🐾 v75: 修复纯"昨天"格式漏匹配 — 支持 昨天/昨天14:59/刚刚/5分钟前/14:59
+                    const timeMatch = text.match(/(\d{1,2}:\d{2}|刚刚|昨天\d{2}:\d{2}|昨天|\d+分钟前|\d+小时前|\d+天前)/);
+                    if (timeMatch) {
+                        const timeIdx = text.indexOf(timeMatch[1]);
+                        const nameBefore = text.substring(0, timeIdx);
+                        const hasUnread = item.querySelector('[class*="unread"], [class*="new"], [class*="red"], .semi-badge') !== null;
+
+                        // 🐾 v65: 修复用户名提取不稳定导致重复回复 - 先去掉粉丝标签,再去掉前缀未读数字,确保每次提取一致
+                        // 🐾 v65: 统一用户名提取逻辑 - 不管有无未读标记,都用同一套规则
+                        let name = nameBefore;
+                        // 步骤1: 去掉前缀未读数字(1-2位)
+                        name = name.replace(/^\d{1,2}/, '').trim();
+                        // 步骤2: 去掉"粉丝"后缀标签
+                        name = name.replace(/粉丝$/, '').trim();
+                        // 步骤3: 兜底 - 如果名字仍为空或包含"粉丝"前缀,再处理
+                        if (!name || name.startsWith('粉丝')) {
+                            // 从后往前找,跳过"置顶/已读/删除"
+                            for (let k = 1; k <= nameBefore.length; k++) {
+                                name = nameBefore.substring(k);
+                                if (name && !/^(置顶|已读|删除)/.test(name)) break;
+                            }
+                            name = name.replace(/粉丝$/, '').trim();
+                        }
+
+                            let message = text.substring(timeIdx + timeMatch[1].length).replace(/(置顶|已读|删除)+$/g, '').trim();
+
+                            const isOurReply = message.includes(invisibleMark);
+                            const isOurKeyword = ourKeywords.some(kw => message.includes(kw)) || ourRepliedContents.some(kw => message.includes(kw));
+
+                            // 跳过主人账号(自家号)
+                            if (['南阳嗨舞工作室'].includes(name)) continue;
+
+                            if (name && name.length >= 1 && name.length <= 25) {
+                                if (isOurReply || isOurKeyword) continue;
+                                if (!message || message.length < 1) continue;
+
+                                results.push({
+                                    name, message, time: timeMatch[1],
+                                    x: rect.x + 50, y: rect.y + rect.height / 2,
+                                    hasUnread,
+                                    isOurReply,
+                                    id: `${name}|${message.substring(0, 30)}`,
+                                    tab: tabName // 🐾 v63: 记录来源tab,进入对话时切到正确tab
+                                });
+                            }
+                    }
+                }
+                return results;
+            }, OUR_REPLIES, OUR_REPLY_CONTENTS, INVISIBLE_MARK, tabName);
+        };
+
+        // 🐾 智能轮询加载:15秒间隔,最大2分钟(8次)
+        let tabItems = [];
+        let loaded = false;
+        log(`⏳ 开始轮询加载 [${tabName}]...`);
+
+        // 🐾 v48: DOM结构验证(防止改版后完全找不到容器)
+        const domCheck = await page.evaluate(() => {
+            const liCount = document.querySelectorAll('li.semi-list-item').length;
+            const gridCount = document.querySelectorAll('div[role="gridcell"]').length;
+            const chatCount = document.querySelectorAll('[class*="chat-item"]').length;
+            const text = document.body.innerText.substring(0, 200);
+            return { liCount, gridCount, chatCount, text };
+        });
+        log(`🔍 [${tabName}] DOM验证: li=${domCheck.liCount}, gridcell=${domCheck.gridCount}, chat-item=${domCheck.chatCount}`);
+
+        // 🐾 v59: DOM找不到元素时,分两种情况处理
+        if (domCheck.liCount === 0 && domCheck.gridCount === 0 && domCheck.chatCount === 0) {
+            // 情况A:确认有空状态文本 → 直接跳过(确实没有私信)
+            const isEmptyText = domCheck.text.includes('还没有收到私信') || domCheck.text.includes('暂无新私信');
+            if (isEmptyText) {
+                log(`✅ [${tabName}] 检测到空状态文本,确认无新私信`);
+                tabItems = [];
+                loaded = true;
+            } else {
+                // 情况B:无空状态文本 → 页面还在加载中,给足2分钟加载窗口
+                log(`⏳ [${tabName}] DOM无元素且无空状态,页面加载中,等待加载...`);
+                for (let attempt = 1; attempt <= 8; attempt++) {
+                    await new Promise(r => setTimeout(r, 15000));
+
+                    // 每次检查是否加载出元素
+                    const recheck = await page.evaluate(() => ({
+                        liCount: document.querySelectorAll('li.semi-list-item').length,
+                        gridCount: document.querySelectorAll('div[role="gridcell"]').length,
+                        chatCount: document.querySelectorAll('[class*="chat-item"]').length,
+                        text: document.body.innerText
+                    }));
+
+                    if (recheck.liCount > 0 || recheck.gridCount > 0 || recheck.chatCount > 0) {
+                        log(`✅ [${tabName}] 延迟加载成功,DOM元素已出现 (耗时 ${attempt*15}s)`);
+                        break; // 跳出等待,进入 extractDmItems
+                    }
+
+                    // 检查是否变为空状态
+                    if (recheck.text.includes('还没有收到私信') || recheck.text.includes('暂无新私信')) {
+                        loaded = true;
+                        log(`✅ [${tabName}] 等待后确认为空状态,无新私信 (耗时 ${attempt*15}s)`);
+                        break;
+                    }
+
+                    if (attempt < 8) log(`⏳ [${tabName}] 继续等待加载... (${attempt}/8)`);
+                }
+
+                if (!loaded) {
+                    // 2分钟仍未加载出元素 → 提取一次看看
+                    tabItems = await extractDmItems();
+                    if (tabItems.length === 0) {
+                        loaded = true;
+                        log(`✅ [${tabName}] 2分钟等待结束,确认无新私信`);
+                    }
+                }
+            }
+        }
+
+        if (!loaded) {
+            // 🐾 v74: DOM有占位符但无真实消息时,延长加载等待至2分钟(12次×10秒),适配抖音私信页慢加载
+            for (let attempt = 1; attempt <= 12; attempt++) {
+                await new Promise(r => setTimeout(r, 10000));
+            tabItems = await extractDmItems();
+
+            if (tabItems.length > 0) {
+                loaded = true;
+                log(`✅ [${tabName}] 列表加载成功,发现 ${tabItems.length} 条 (耗时 ${attempt*10}s)`);
+                break;
+            }
+
+            // 检查空状态
+            const isEmptyNow = await page.evaluate(() => {
+                const text = document.body.innerText;
+                return text.includes('还没有收到私信') || text.includes('暂无新私信') || text.includes('暂无消息');
+            });
+            if (isEmptyNow) {
+                loaded = true;
+                log(`✅ [${tabName}] 轮询中检测到空状态,确认无新私信 (耗时 ${attempt*10}s)`);
+                break;
+            }
+
+            if (attempt >= 12) {
+                loaded = true;
+                log(`✅ [${tabName}] 多次提取无真实消息,视为无新私信 (耗时 ${attempt*10}s)`);
+                break;
+            }
+
+            log(`⏳ [${tabName}] 列表加载中... (${attempt}/12)`);
+        }
+        } // closes first if (!loaded) wrapper
+
+        if (!loaded) {
+            log(`🚨 [${tabName}] 列表加载超时!跳过`);
+            tabItems = [];
+        }
+
+        // 🐾 v69: 滚动触发虚拟列表渲染(解决DOM有元素但提取到0条的问题)
+        log(`📜 [${tabName}] 滚动触发虚拟列表渲染...`);
+        for (let scrollTrigger = 0; scrollTrigger < 3; scrollTrigger++) {
+            await page.evaluate(() => {
+                const container = document.querySelector('main') || document.querySelector('[class*="scroll"]') || document.body;
+                container.scrollTop = container.scrollHeight;
+            });
+            await new Promise(r => setTimeout(r, 2000));
+            await page.evaluate(() => {
+                const container = document.querySelector('main') || document.querySelector('[class*="scroll"]') || document.body;
+                container.scrollTop = 0;
+            });
+            await new Promise(r => setTimeout(r, 1000));
+        }
+        log(`✅ [${tabName}] 虚拟列表触发完成`);
+
+        // v21: 滚动扫描所有消息
+        const allItems = [...tabItems];
+        const seenKeys = new Set(allItems.map(i => i.id));
+        let scrollAttempts = 0;
+        const maxScrolls = 5;
+
+        while (scrollAttempts < maxScrolls) {
+            const items = await extractDmItems();
+
+            let newFound = false;
+            for (const item of items) {
+                const key = item.id;
+                if (!seenKeys.has(key)) {
+                    seenKeys.add(key);
+                    allItems.push(item);
+                    newFound = true;
+                }
+            }
+
+            // 没有新消息了,说明到底了
+            if (!newFound && scrollAttempts > 0) {
+                log(`📜 [${tabName}] 滚动到底,共收集 ${allItems.length} 条`);
+                break;
+            }
+
+            // v21: 拟人化滚动(小步滚动,模拟鼠标滚轮)
+            await page.evaluate(() => {
+                const container = document.querySelector('.semi-list') ||
+                                  document.querySelector('[class*="semi-list"]') ||
+                                  document.querySelector('[class*="virtual-list"]') ||
+                                  document.documentElement;
+                container.scrollBy({ top: 200 + Math.random() * 200, behavior: 'instant' });
+            });
+            await randomDelay(800, 2000); // 模拟阅读节奏
+            scrollAttempts++;
+        }
+
+        return allItems;
+    };
+
+    // v21: 扫描"朋友私信"和"陌生人私信"两个tab,跳过"群消息"
+    let allDmItems = [];
+    const tabsToScan = ['朋友私信', '陌生人私信'];
+    for (const tab of tabsToScan) {
+        const items = await scanDmTab(tab);
+        log(`📩 [${tab}] 找到 ${items.length} 条`);
+        allDmItems = allDmItems.concat(items);
+    }
+    log(`📩 合计 ${allDmItems.length} 条私信`);
+
+    // 去重(同一用户只保留一条)
+    const seen = new Set();
+    const dmItems = allDmItems.filter(item => {
+        if (seen.has(item.name)) return false;
+        seen.add(item.name);
+        return true;
+    });
+    const replied = loadReplied();
+    let repliedCount = 0;
+
+    // v7.8:用户级去重 - 同一轮中每个用户只回复一次
+    const repliedThisRound = new Set();
+
+    // v11:回声冷却机制 - 防止用户不断复制我们的回复导致死循环
+    // 读取上次的回声冷却记录(持久化)
+    let echoCooldown = {};
+    try {
+        if (fs.existsSync(CONFIG.COOLDOWN_FILE)) {
+            echoCooldown = JSON.parse(fs.readFileSync(CONFIG.COOLDOWN_FILE, 'utf8'));
+        }
+    } catch(e) {}
+
+    // 清理过期的冷却记录(超过 2 小时)
+    const now = Date.now();
+    for (const user in echoCooldown) {
+        if (now - echoCooldown[user] > 2 * 60 * 60 * 1000) {
+            delete echoCooldown[user];
+        }
+    }
+
+    // 🐾 v68: 私信对话历史 + wechatGiven 标记(上下文AI对话)
+    let dmHistory = {};
+    try {
+        if (fs.existsSync('/tmp/douyin_dm_history.json')) {
+            dmHistory = JSON.parse(fs.readFileSync('/tmp/douyin_dm_history.json', 'utf8'));
+        }
+    } catch(e) {}
+    // 清理过期记录(超过 24 小时)
+    for (const user in dmHistory) {
+        if (now - (dmHistory[user].lastUpdate || 0) > 24 * 60 * 60 * 1000) {
+            delete dmHistory[user];
+        }
+    }
+
+    for (const dm of dmItems.slice(0, 3)) {
+        // 用户级去重 - 同一轮中每个用户只回复一次
+        if (repliedThisRound.has(dm.name)) { log(`i️ 本轮已回复 ${dm.name},跳过`); continue; }
+
+        // 🐾 v68: 初始化该用户的对话历史
+        if (!dmHistory[dm.name]) {
+            dmHistory[dm.name] = { history: [], wechatGiven: false, lastUpdate: 0 };
+        }
+
+        // v8.1 私信自回复检测:如果用户复制了我们说的话发回来,用不同引导语
+        const isOurEcho = OUR_REPLY_CONTENTS.some(kw => dm.message.includes(kw));
+        const isPreviewOurReply = dm.isOurReply || isOurEcho;
+
+        log(`👤 新私信 [${dm.name}]: ${dm.message.substring(0, 40)}`);
+
+        // v10: 先点击进入对话页,再决定如何回复 (修复缓存 key 错误问题)
+        // 无论预览是不是我们的回复,都先进入对话页获取真实消息上下文
+
+        // v21: 私信进入对话 - 特征验证+多方式重试+失败截图
+        let enteredConversation = false;
+
+        // 特征检测: 验证是否进入了对话页(不依赖坐标,看页面实际状态)
+        const verifyDMConversation = async () => {
+            return await page.evaluate(() => {
+                const bodyText = document.body.innerText;
+
+                // 🐾 v26加固: 放宽检测条件,适配抖音私信页面结构变化
+
+                // 条件1: contenteditable输入框(原始检测)
+                const inputs = document.querySelectorAll('[contenteditable="true"]');
+                for (const el of inputs) {
+                    const r = el.getBoundingClientRect();
+                    if (r.y > 300 && r.width > 50) {
+                        const parent = el.closest('div') || el.parentElement;
+                        if (parent && parent.textContent.includes('发送')) {
+                            return { ok: true, reason: 'contenteditable+发送按钮' };
+                        }
+                        if (bodyText.includes('发送')) {
+                            return { ok: true, reason: 'contenteditable+页面有发送' };
+                        }
+                        return { ok: true, reason: '底部contenteditable' };
+                    }
+                }
+
+                // 条件2: textarea输入框(部分抖音版本用textarea)
+                const textareas = document.querySelectorAll('textarea');
+                for (const el of textareas) {
+                    const r = el.getBoundingClientRect();
+                    if (r.y > 300 && r.width > 100 && r.height > 20) {
+                        return { ok: true, reason: 'textarea输入框' };
+                    }
+                }
+
+                // 条件3: 对话页特征 - 右侧有消息气泡 + 输入区域
+                // 对话页会有 .chat-message 或类似的消息容器,且包含用户消息
+                for (const el of document.querySelectorAll('[class*="message"], [class*="chat"], [class*="bubble"]')) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 100 && r.height > 30 && el.offsetParent) {
+                        const text = el.textContent.trim();
+                        // 检查是否包含对话内容(不是纯UI标签)
+                        if (text.length > 2 && !text.includes('私信') && !text.includes('管理')) {
+                            return { ok: true, reason: '对话消息气泡' };
+                        }
+                    }
+                }
+
+                // 条件4: 页面URL包含chat且存在输入框样式的元素
+                if (window.location.href.includes('chat')) {
+                    for (const el of document.querySelectorAll('input, [role="textbox"], [aria-label]')) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 100 && r.height > 20 && r.y > 200) {
+                            return { ok: true, reason: '输入框元素(chat页面)' };
+                        }
+                    }
+                }
+
+                return { ok: false, reason: '无对话特征' };
+            });
+        };
+
+        // 🐾 v63: 进入对话前先切到正确的tab
+        const targetTab = dm.tab || '朋友私信';
+
+        // 🐾 v63修复: 离开对话页,回到私信列表(先切到另一个tab再切回来,强制列表重新加载)
+        await page.evaluate(() => {
+            for (const tab of document.querySelectorAll('.semi-tabs-tab, [class*="tab"]')) {
+                if (tab.textContent.trim() === '群消息') {
+                    tab.click(); return;
+                }
+            }
+        });
+        await randomDelay(2000, 3000);
+
+        await page.evaluate((name) => {
+            for (const tab of document.querySelectorAll('.semi-tabs-tab, [class*="tab"]')) {
+                if (tab.textContent.trim() === name) {
+                    tab.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                    tab.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                    tab.click();
+                    return;
+                }
+            }
+        }, targetTab);
+        await randomDelay(5000, 8000); // 给列表足够时间加载
+
+        await page.evaluate((name) => {
+            for (const tab of document.querySelectorAll('.semi-tabs-tab, [class*="tab"]')) {
+                if (tab.textContent.trim() === name) {
+                    tab.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                    tab.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+                    tab.click();
+                    return;
+                }
+            }
+        }, targetTab);
+        await randomDelay(2000, 3000);
+
+        // 🐾 v63: 改进私信进入对话逻辑 - 移除截图验证,采用长等待+DOM检测
+        const dmItemRect = await page.evaluate((targetName) => {
+            const items = document.querySelectorAll('li.semi-list-item');
+            for (const item of items) {
+                const text = item.textContent.trim();
+                if (text.includes(targetName) && text.length > 10) {
+                    const link = item.querySelector('a');
+                    if (link) {
+                        const rect = link.getBoundingClientRect();
+                        return {
+                            x: Math.round(rect.left + rect.width / 2),
+                            y: Math.round(rect.top + rect.height / 2),
+                            text: text.substring(0, 40)
+                        };
+                    }
+                    const rect = item.getBoundingClientRect();
+                    return {
+                        x: Math.round(rect.left + 50),
+                        y: Math.round(rect.top + rect.height / 2),
+                        text: text.substring(0, 40)
+                    };
+                }
+            }
+            return null;
+        }, dm.name);
+
+        if (dmItemRect) {
+            log(`📍 找到私信项: ${dmItemRect.text}`);
+
+            // 依次尝试三种点击方式
+            const clickResult = await page.evaluate((targetName) => {
+                const items = document.querySelectorAll('li.semi-list-item');
+                for (const item of items) {
+                    const text = item.textContent.trim();
+                    if (text.includes(targetName) && text.length > 10) {
+                        const link = item.querySelector('a');
+                        // 方案1: 原生 click
+                        if (link) {
+                            link.click();
+                            return { ok: true, method: 'link.click' };
+                        }
+                        // 方案2: dispatchEvent
+                        item.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                        return { ok: true, method: 'dispatchEvent' };
+                    }
+                }
+                return { ok: false };
+            }, dm.name);
+
+            log(`🖱️ 点击尝试: ${clickResult.ok ? clickResult.method : '失败'}`);
+
+            // 等待循环:每15秒查一次,最多2分钟(8次)
+            const maxAttempts = 8;
+            const waitTime = 15000; // 15秒
+
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                log(`⏳ 等待页面加载... (${attempt}/${maxAttempts}, 等待${waitTime/1000}s)`);
+                await new Promise(r => setTimeout(r, waitTime));
+
+                // DOM 检查:寻找 contenteditable 输入框
+                const checkResult = await page.evaluate(() => {
+                    const editors = document.querySelectorAll('[contenteditable="true"]');
+                    for (const ed of editors) {
+                        const rect = ed.getBoundingClientRect();
+                        // 输入框通常较大且在页面中下部
+                        if (rect.width > 100 && rect.height > 20) {
+                            return { ok: true, reason: 'contenteditable found' };
+                        }
+                    }
+                    // 检查发送按钮
+                    const btns = document.querySelectorAll('button');
+                    for (const btn of btns) {
+                        if (btn.textContent.trim() === '发送') {
+                            const rect = btn.getBoundingClientRect();
+                            if (rect.width > 30 && rect.height > 20) {
+                                return { ok: true, reason: 'send button found' };
+                            }
+                        }
+                    }
+                    return { ok: false };
+                });
+
+                if (checkResult.ok) {
+                    enteredConversation = true;
+                    log(`✅ 成功进入私信对话 (耗时 ${attempt*15}s, 验证: ${checkResult.reason})`);
+                    break;
+                } else {
+                    log(`⏳ 还没进去... 继续等待`);
+                }
+            }
+        }
+
+        // 所有尝试都失败 -> 写入队列，由心跳发送到QQ
+        if (!enteredConversation) {
+            log(`🚨 无法进入 [${dm.name}] 的私信对话,已跳过`);
+            try {
+                const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+                const failMsg = `⚠️ 抖音私信处理失败:无法进入 [${dm.name}] 的对话页面,加载超时。 (${time})`;
+                log('📤 失败通知通过三层推送发送...');
+                await sendReportToQQ(failMsg);
+            } catch(e) {
+                log('⚠️ 报告发送失败: ' + e.message.substring(0, 100));
+            }
+            continue;
+        }
+
+        // v10: 进入对话页后,始终提取用户真实消息作为缓存 key
+        const extractResult = await page.evaluate((invisibleMark, ourKeywords, ourRepliedContents, studioWechat) => {
+            const bodyText = document.body.innerText;
+            const lines = bodyText.split('\n').map(l => l.trim()).filter(l => l);
+
+            // 解析时间戳 + 消息对,找最后一条用户消息
+            const timePattern = /^(昨天(\s*\d{2}:\d{2})?|凌晨\s*\d{2}:\d{2}|刚刚|\d+\s*分钟前|\d+\s*小时前|\d+\s*天前)/;
+            let lastUserMsg = null;
+            let lastTime = null;
+
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (timePattern.test(line)) {
+                    lastTime = line;
+                    if (i + 1 < lines.length) {
+                        const msg = lines[i + 1];
+                        // 跳过我们的回复(零宽标记 + 关键词 + 引导语)
+                        if (msg.includes(invisibleMark)) continue;
+                        if (ourKeywords.some(kw => msg.includes(kw))) continue;
+                        if (ourRepliedContents.some(kw => msg.includes(kw))) continue;
+                        if (msg.includes(studioWechat)) continue;
+                        // 跳过系统消息
+                        if (msg.includes('撤回') || msg.includes('系统') || msg.includes('新类型消息') || msg.length < 2) continue;
+                        if (/^(昨天 | 凌晨 | 刚刚 | 加载 | 查看)/.test(msg)) continue;
+                        lastUserMsg = msg;
+                    }
+                }
+            }
+            return lastUserMsg;
+        }, INVISIBLE_MARK, OUR_REPLIES, OUR_REPLY_CONTENTS, '15083388123', '150-8338-8123', '150 8338 8123');
+
+        // v11: 直接用私信列表里的最新消息作为缓存 key
+        // dm.message 就是列表预览显示的最后一条消息,最准确
+        const actualMessage = dm.message;
+        if (!actualMessage || actualMessage.length < 2) {
+            log(`⚠️ 无法获取有效消息内容,跳过`);
+            continue;
+        }
+        const cacheKey = dm.name;
+
+        // 🐾 v65: 私信去重改用用户名 - 不管消息内容变没变,同一用户同一轮不再回复
+        if (replied.dms.includes(cacheKey)) {
+            log(`i️ 已回复过该消息,跳过: ${cacheKey}`);
+            continue;
+        }
+
+        log(`📥 缓存 key: ${cacheKey}`);
+
+        // 现在决定回复内容
+        let reply;
+        if (isPreviewOurReply) {
+            // v9.1:回声冷却检查
+            const lastEchoTime = echoCooldown[dm.name] || 0;
+            if (now - lastEchoTime < 60 * 60 * 1000) {
+                log(`⏱️ 回声冷却中:${dm.name},跳过`);
+                continue;
+            }
+
+            const echoReplies = [
+                '哈哈你好呀~想了解舞蹈课还是体验课呀?我来给你介绍~' + INVISIBLE_MARK,
+                '嗨嗨~是想问课程还是价格呀?直接说就行,看到都会回的~' + INVISIBLE_MARK,
+                '哈喽~欢迎来玩!是想约体验课还是看课表呀?' + INVISIBLE_MARK,
+            ];
+            reply = echoReplies[Math.floor(Math.random() * echoReplies.length)];
+            log(`🔄 预览是我们的回复,用引导语 + 提取到的用户消息`);
+            echoCooldown[dm.name] = now;
+        } else {
+            reply = await generateReply(actualMessage, 'dm');
+        }
+        log(`🤖 AI: ${reply.substring(0, 40)}...`);
+
+        // 🐾 v65: 最终防护 - 消息内容带零宽标记坚决不回复
+        if (actualMessage && actualMessage.includes(INVISIBLE_MARK)) {
+            log(`🚫 最终防护: 检测到零宽标记,跳过 [${dm.name}]`);
+            continue;
+        }
+
+        // 🐾 v68: AI 上下文私信对话(替换旧版 v49/v64/v67 规则)
+        if (!isPreviewOurReply) {
+            const userHist = dmHistory[dm.name] || { history: [], wechatGiven: false };
+            // 记录用户消息
+            userHist.history.push({ role: 'user', content: actualMessage });
+            // 保留最近 6 轮(12条消息)
+            if (userHist.history.length > 12) {
+                userHist.history = userHist.history.slice(-12);
+            }
+            // 调用 AI 带上下文生成回复
+            reply = await callAIWithHistory(actualMessage, userHist.history, userHist.wechatGiven, 'dm');
+            if (reply) {
+                // 记录 AI 回复
+                userHist.history.push({ role: 'assistant', content: reply.replace(INVISIBLE_MARK, '') });
+                // 检查是否已给微信号（支持多种格式：纯数字/横杠/空格分隔）
+                const wechatPattern = /150[-\s]?8338[-\s]?8123|一五零八三三八八一二三/.test(reply);
+                if (wechatPattern) {
+                    userHist.wechatGiven = true;
+                    incrementWechatCount(); // v73: AI 路径也给微信号计数
+                    log(`📱 v68: 本轮已给微信号,标记 wechatGiven=true`);
+                }
+                userHist.lastUpdate = now;
+                dmHistory[dm.name] = userHist;
+            }
+        }
+
+        // 🐾 v39.0: 私信也改用DOM直接注入(CDP keyboard不可靠)
+        log(`🔄 DOM注入私信文本(${reply.length}字符)...`);
+        const dmInputInjected = await page.evaluate((text) => {
+            for (const el of document.querySelectorAll('[contenteditable="true"]')) {
+                const r = el.getBoundingClientRect();
+                if (r.width > 100) {
+                    // 清空并注入
+                    el.innerText = text;
+                    el.textContent = text;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: text }));
+                    return true;
+                }
+            }
+            return false;
+        }, reply);
+
+        if (!dmInputInjected) {
+            log('⚠️ 私信文本注入失败,跳过');
+            continue;
+        }
+        log('✅ 私信文本注入成功');
+
+        // v19.2: 触发DOM input事件激活React状态
+        await page.evaluate(() => {
+            for (const el of document.querySelectorAll('[contenteditable="true"]')) {
+                if (el.getBoundingClientRect().width > 100) {
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '' }));
+                    return true;
+                }
+            }
+            return false;
+        });
+
+        await randomDelay(500, 800);
+        log(`📝 输入成功`);
+
+        // 🐾 v61: 多方案私信发送按钮点击机制
+        const dmSendBtn = await page.evaluate(() => {
+            for (const btn of document.querySelectorAll('button')) {
+                if (btn.textContent.trim() === '发送') {
+                    const r = btn.getBoundingClientRect();
+                    return { x: r.x + r.width/2, y: r.y + r.height/2, w: r.width, h: r.height };
+                }
+            }
+            return null;
+        });
+
+        if (!dmSendBtn) {
+            log(`⚠️ 发送失败:找不到发送按钮`);
+            continue;
+        }
+
+        let sendClicked = false;
+
+        // ========== 方案1:原生 DOM click() ==========
+        log('📤 尝试发送方案1: 原生 DOM click()...');
+        sendClicked = await page.evaluate(() => {
+            for (const btn of document.querySelectorAll('button')) {
+                if (btn.textContent.trim() === '发送') {
+                    btn.click();
+                    return true;
+                }
+            }
+            return false;
+        });
+
+        await randomDelay(2000, 2500);
+        let sendVerified = await page.evaluate(() => {
+            for (const div of document.querySelectorAll('[contenteditable="true"]')) {
+                const rect = div.getBoundingClientRect();
+                if (rect.width > 100 && div.innerText.trim() === '') {
+                    return true;
+                }
+            }
+            return false;
+        });
+        if (sendVerified) { log('✅ 方案1发送成功'); }
+
+        // ========== 方案2:dispatchEvent ==========
+        if (!sendVerified) {
+            log('📤 尝试发送方案2: dispatchEvent...');
+            sendClicked = await page.evaluate(() => {
+                for (const btn of document.querySelectorAll('button')) {
+                    if (btn.textContent.trim() === '发送') {
+                        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                        return true;
+                    }
+                }
+                return false;
+            });
+            await randomDelay(2000, 2500);
+            sendVerified = await page.evaluate(() => {
+                for (const div of document.querySelectorAll('[contenteditable="true"]')) {
+                    const rect = div.getBoundingClientRect();
+                    if (rect.width > 100 && div.innerText.trim() === '') {
+                        return true;
+                    }
+                }
+                return false;
+            });
+            if (sendVerified) { log('✅ 方案2发送成功'); }
+        }
+
+        // ========== 方案3:鼠标点击(原方案兜底) ==========
+        if (!sendVerified) {
+            log('📤 尝试发送方案3: 鼠标点击...');
+            await page.mouse.click(dmSendBtn.x, dmSendBtn.y);
+            await randomDelay(2000, 2500);
+            sendVerified = await page.evaluate(() => {
+                for (const div of document.querySelectorAll('[contenteditable="true"]')) {
+                    const rect = div.getBoundingClientRect();
+                    if (rect.width > 100 && div.innerText.trim() === '') {
+                        return true;
+                    }
+                }
+                return false;
+            });
+            if (sendVerified) { log('✅ 方案3发送成功'); }
+        }
+
+        log(`📤 点击发送按钮:(${dmSendBtn.x.toFixed(0)},${dmSendBtn.y.toFixed(0)})`);
+
+        // 发送后验证(和评论一样的逻辑)- 如果方案1/2/3已验证成功则跳过
+        let maxRetries = 2;
+
+        if (!sendVerified) {
+        for (let retry = 0; retry < maxRetries; retry++) {
+            if (retry > 0) {
+                log(`🔄 私信发送验证失败,第${retry}次重试...`);
+                // 重新找输入框并聚焦
+                const retryInputRect = await page.evaluate(() => {
+                    for (const el of document.querySelectorAll('[contenteditable="true"]')) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 100) return { x: r.x + r.width/2, y: r.y + r.height/2 };
+                    }
+                    return null;
+                });
+                if (!retryInputRect) {
+                    log(`⚠️ 重试未找到输入框,放弃`);
+                    break;
+                }
+                await page.mouse.click(retryInputRect.x, retryInputRect.y);
+                await randomDelay(500, 800);
+
+                // CDP输入
+                const retryClient = await page.createCDPSession();
+                try {
+                    for (const char of reply) {
+                        await retryClient.send('Input.dispatchKeyEvent', { type: 'keyDown', text: char, unmodifiedText: char, key: char });
+                        await randomDelay(20, 40);
+                        await retryClient.send('Input.dispatchKeyEvent', { type: 'keyUp', key: char });
+                        await randomDelay(20, 40);
+                    }
+                } finally {
+                    await retryClient.detach();
+                }
+                await randomDelay(1000, 1500);
+
+                // 找发送按钮坐标并直接点击
+                const retryBtn = await page.evaluate(() => {
+                    for (const btn of document.querySelectorAll('button')) {
+                        if (btn.textContent.trim() === '发送') {
+                            const r = btn.getBoundingClientRect();
+                            return { x: r.x + r.width/2, y: r.y + r.height/2 };
+                        }
+                    }
+                    return null;
+                });
+
+                if (retryBtn) {
+                    await page.mouse.click(retryBtn.x, retryBtn.y);
+                } else {
+                    log(`⚠️ 重试未找到发送按钮,放弃`);
+                    break;
+                }
+                await randomDelay(2000, 2500);
+            }
+
+            // 验证发送成功(3个条件满足任意一个)
+            const verifyResult = await page.evaluate(() => {
+                // 条件1: 输入框为空
+                for (const div of document.querySelectorAll('[contenteditable="true"]')) {
+                    const rect = div.getBoundingClientRect();
+                    if (rect.width > 100 && div.innerText.trim() === '') {
+                        return { success: true, method: 'input empty' };
+                    }
+                }
+
+                // 条件2: "发送成功"toast
+                for (const el of document.querySelectorAll('*')) {
+                    if (el.textContent.includes('发送成功') && el.offsetParent) {
+                        return { success: true, method: 'toast shown' };
+                    }
+                }
+
+                // 条件3: 消息区域出现自己的回复
+                const bodyText = document.body.innerText;
+                if (bodyText.includes('已发送') || bodyText.includes('刚刚')) {
+                    return { success: true, method: 'message shown' };
+                }
+
+                return { success: false, method: 'none' };
+            });
+
+            if (verifyResult.success) {
+                sendVerified = true;
+                log(`✅ 私信发送验证通过 (方法: ${verifyResult.method})`);
+                break;
+            } else {
+                log(`⚠️ 私信发送验证失败: ${verifyResult.method}`);
+            }
+        }
+        }
+
+        if (!sendVerified) {
+            log(`❌ 私信发送最终失败,尝试 v69 备用方案 (keyboard.type + Enter)`);
+
+            // 🐾 v69: 备用发送方案 - 重新聚焦输入框 + keyboard.type + Enter 键
+            const backupResult = await page.evaluate((text) => {
+                // 找输入框
+                for (const el of document.querySelectorAll('[contenteditable="true"]')) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 100) {
+                        el.focus();
+                        return { found: true };
+                    }
+                }
+                return { found: false };
+            }, reply);
+
+            if (backupResult.found) {
+                await randomDelay(500, 800);
+                // 用 keyboard.type 逐字输入
+                await page.keyboard.type(reply, { delay: 30 });
+                await randomDelay(1000, 1500);
+                // 用 Enter 键发送
+                await page.keyboard.press('Enter');
+                await randomDelay(3000, 4000);
+
+                // 验证发送
+                sendVerified = await page.evaluate(() => {
+                    for (const div of document.querySelectorAll('[contenteditable="true"]')) {
+                        const rect = div.getBoundingClientRect();
+                        if (rect.width > 100 && div.innerText.trim() === '') {
+                            return true;
+                        }
+                    }
+                    return false;
+                });
+                if (sendVerified) {
+                    log('✅ v69 备用方案发送成功');
+                } else {
+                    log('❌ v69 备用方案也失败了,跳过');
+                }
+            } else {
+                log('⚠️ 未找到输入框,无法使用备用方案');
+            }
+        }
+
+        if (!sendVerified) {
+            log(`❌ 私信发送最终失败,跳过 [${dm.name}]`);
+            continue;
+        }
+
+        // 回复成功 → 加入本轮已回复集合 + 持久化缓存
+        replied.dms.push(cacheKey); repliedCount++; repliedThisRound.add(dm.name);
+        log(`✅ 已回复 ${dm.name}`);
+        // 🐾 v74: 记录本轮详情供报告使用
+        __lastResults.dms.push({ user: dm.name, content: dm.message.substring(0, 50), reply: reply.substring(0, 50) });
+        saveReplied(replied);
+
+        // 返回列表页,为下一条私信做准备
+        await page.goto('https://creator.douyin.com/creator-micro/data/following/chat', { waitUntil: 'networkidle2', timeout: 30000 });
+        await randomDelay(1500, 2000);
+
+        await randomDelay(CONFIG.HUMAN_DELAY.min, CONFIG.HUMAN_DELAY.max);
+    }
+
+    // v11:保存回声冷却记录到持久化文件
+    try {
+        fs.writeFileSync(CONFIG.COOLDOWN_FILE, JSON.stringify(echoCooldown));
+    } catch(e) {}
+
+    // 🐾 v68: 保存私信对话历史到持久化文件
+    try {
+        fs.writeFileSync('/tmp/douyin_dm_history.json', JSON.stringify(dmHistory));
+    } catch(e) {}
+
+    log(`📊 私信检查完毕:找到 ${dmItems.length} 条,已回复 ${repliedCount} 条`);
+    return repliedCount;
+};
+
+// ==================== 自动报告 ====================
+// v70 修复：不再使用 execSync 调用 openclaw message send（子进程环境变量不一致导致消息丢失）
+// 改为写入待发送队列文件，由 OpenClaw 心跳检查并发送
+const reportCheck = () => {
+    const time = new Date().toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' });
+    let msg = `🐾 石榴自动回复检查结果\n`;
+    msg += `⏰ ${time}\n`;
+    
+    // 🐾 v74: 从全局变量读取本轮详情
+    const comments = __lastResults.comments || [];
+    const dms = __lastResults.dms || [];
+    
+    // 评论汇总
+    msg += `💬 评论: ${comments.length} 条`;
+    if (comments.length > 0) {
+        for (const c of comments) {
+            msg += `\n   ${c.user}: "${c.content}"\n   → 回复: "${c.reply}"`;
+        }
+    }
+    msg += `\n`;
+    
+    // 私信汇总
+    msg += `📩 私信: ${dms.length} 条`;
+    if (dms.length > 0) {
+        for (const d of dms) {
+            msg += `\n   ${d.user}: "${d.content}"\n   → 回复: "${d.reply}"`;
+        }
+    }
+    msg += `\n`;
+    
+    if (comments.length === 0 && dms.length === 0) {
+        msg += `✅ 本轮无新评论和私信\n`;
+    }
+    
+    // 🐾 v63: 附带 Token 消耗统计
+    try {
+        let total = 0;
+        // 抖音自动回复 token
+        if (fs.existsSync(AI_CONFIG.TOKEN_FILE)) {
+            const tokenData = JSON.parse(fs.readFileSync(AI_CONFIG.TOKEN_FILE, 'utf8'));
+            total = tokenData.total || 0;
+        }
+        // 🐾 小游戏 AI token（共享同一个 API Key）
+        const gameTokenFile = '/tmp/game_tokens.json';
+        let gameTokens = 0;
+        if (fs.existsSync(gameTokenFile)) {
+            try {
+                const gData = JSON.parse(fs.readFileSync(gameTokenFile, 'utf8'));
+                gameTokens = gData.total || 0;
+            } catch(e) {}
+        }
+        const combinedTotal = total + gameTokens;
+        const pct = ((combinedTotal / AI_CONFIG.TOKEN_LIMIT) * 100).toFixed(1);
+        const remaining = AI_CONFIG.TOKEN_LIMIT - combinedTotal;
+        msg += `🔢 Token 消耗: ${combinedTotal.toLocaleString()} / ${AI_CONFIG.TOKEN_LIMIT.toLocaleString()} (${pct}%) 剩余 ${remaining.toLocaleString()}`;
+        if (gameTokens > 0) {
+            msg += `\n   └ 抖音: ${total.toLocaleString()} | 小游戏: ${gameTokens.toLocaleString()}`;
+        }
+    } catch(e) {}
+
+    // v72：三层推送：QQ API → CLI → 队列兜底
+    try {
+        (async () => {
+            await sendReportToQQ(msg);
+        })();
+    } catch (e) {
+        log('⚠️ 报告发送异常: ' + e.message.substring(0, 150));
+        writeReportToQueue(msg);
+    }
+};
+
+// ==================== 主循环 ====================
+async function main() {
+    // 🐾 v69: 守护进程单例检查(防止重复运行)
+    const pidFile = '/tmp/douyin_daemon_pid';
+    if (fs.existsSync(pidFile)) {
+        const existingPid = parseInt(fs.readFileSync(pidFile, 'utf8').trim());
+        if (existingPid && existingPid !== process.pid) {
+            try {
+                process.kill(existingPid, 0); // 检查进程是否存在
+                log('🛡️ 检测到已有守护进程运行 (PID ' + existingPid + '),先关闭旧进程');
+                process.kill(existingPid, 'SIGTERM');
+                await sleep(2000);
+                log('✅ 旧进程已关闭');
+            } catch(e) {
+                log('i️ 旧进程已不存在,继续启动');
+            }
+        }
+    }
+    // 写入当前 PID
+    fs.writeFileSync(pidFile, process.pid.toString());
+
+    log('\n🐾 石榴·嗨舞舞室抖音自动回复系统 v75.0 启动(三层推送:QQ API→CLI→队列兜底+单例检查+发送确认机制)');
+    log('🛡️ Stealth 反检测已启用');
+    log('🎯 真人鼠标轨迹 + 打字节奏 + 随机间隔已启用');
+    log('📍 按 Ctrl+C 停止');
+
+    const browser = await puppeteer.connect({ browserURL: CONFIG.CHROME_DEBUG_URL, defaultViewport: null });
+    log('\n✅ Chrome 连接成功');
+
+    // v66: 智能选择页面 - 找有评论/私信界面的那个 tab
+    const allPages = await browser.pages();
+    let page = null;
+    for (const p of allPages) {
+        if (p.url().includes('creator.douyin.com')) {
+            try {
+                const hasUI = await p.evaluate(() => {
+                    return !!document.querySelector('.semi-tabs-pane-active') ||
+                           !!document.querySelector('[class*="comment"]') ||
+                           !!document.querySelector('[class*="message"]') ||
+                           !!document.querySelector('.editor-kit-container');
+                });
+                if (hasUI) { page = p; log('🎯 找到有效页面: ' + p.url()); break; }
+            } catch(e) {}
+        }
+    }
+    // 没找到就开评论页
+    if (!page) {
+        log('⚠️ 没有可用页面,正在自动创建评论页...');
+        page = await browser.newPage();
+        await page.goto('https://creator.douyin.com/creator-micro/interactive/comment', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await sleep(2000);
+    }
+
+    // 🐾 v56: 恢复1280x800固定视口(调试模式下页面需要固定宽度才能正常渲染DOM)
+    await page.setViewport({ width: 1280, height: 800 });
+    log('📐 视口已设置为 1280x800');
+
+    // 🛡️ 增强反自动化检测(stealth 插件 + 额外隐藏)
+    await page.evaluateOnNewDocument(() => {
+        try {
+            // 隐藏 webdriver
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            // 伪装 plugins
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            // 伪装 languages
+            Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });
+            // 伪装 chrome 对象
+            window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {} };
+            // 隐藏 permissions
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) =>
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters);
+            // 覆盖 toString 防止被检测
+            Object.defineProperty(navigator, 'userAgent', {
+                get: () => 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+            });
+        } catch(e) {}
+    });
+    // 对当前已加载的页面注入
+    try {
+        await page.evaluate(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = { runtime: {}, loadTimes: () => {}, csi: () => {} };
+        });
+    } catch(e) {}
+
+    // 监听评论发布 API 响应(调试用)
+    page.on('response', async (resp) => {
+        if (resp.url().includes('comment/publish')) {
+            const status = resp.status();
+            try {
+                const body = await resp.text();
+                const parsed = JSON.parse(body);
+                const cid = parsed?.comment?.cid || 'none';
+                log(`📨 API响应: status=${status}, comment_id=${cid}`);
+            } catch(e) {
+                log(`📨 API响应: status=${status}, body解析失败`);
+            }
+        }
+    });
+
+    // 🐾 首次运行前模拟真人浏览
+    await humanScroll(page);
+    await randomDelay(2000, 4000);
+
+    // 🐾 v74: 清空本轮结果
+    __lastResults = { comments: [], dms: [] };
+
+    await checkComments(page);
+    await checkDMs(page);
+
+    // 🐾 v74: 发送本轮报告
+    reportCheck();
+
+    // 🐾 随机间隔定时器(替代固定 setInterval)
+    log('\n🔄 轮询已启动(白天60分钟/次,深夜3-4小时)...');
+    // v70.1: 页面健康检查 + detached Frame 自动恢复
+    async function ensurePageAlive() {
+        try {
+            await page.evaluate(() => document.title);
+            if (!page.url().includes('creator.douyin.com')) {
+                log('⚠️ 页面不在创作者中心，尝试恢复...');
+                await page.goto(CONFIG.COMMENT_URL, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                log('✅ 页面已导航到评论页');
+            }
+        } catch(e) {
+            log(`⚠️ 页面已失效(${e.message}),正在恢复...`);
+            // 尝试找其他可用页面
+            const allPages = await browser.pages();
+            page = allPages.find(p => p.url().includes('creator.douyin.com'));
+            if (!page) {
+                page = await browser.newPage();
+                await page.goto(CONFIG.COMMENT_URL, { waitUntil: 'domcontentloaded', timeout: 15000 });
+                log('✅ 已新建页面');
+            } else {
+                log('✅ 已切换到有效页面');
+            }
+        }
+    }
+
+    async function scheduleNextCheck() {
+        try {
+            const interval = getNextCheckInterval();
+            const hour = new Date().getHours();
+
+            if (hour >= 23 || hour < 8) {
+                log(`🌙 深夜时段,延迟 ${(interval / 60000).toFixed(0)} 分钟后检查`);
+            } else {
+                log(`⏰ 下次检查将在 ${(interval / 60000).toFixed(1)} 分钟后(${new Date(Date.now() + interval).getHours()}:${String(new Date(Date.now() + interval).getMinutes()).padStart(2, '0')})`);
+            }
+
+            await sleep(interval);
+
+            // v70.1: 检查前确认页面存活
+            await ensurePageAlive();
+
+            // 检查前模拟真人浏览痕迹
+            await humanScroll(page);
+            await randomDelay(1000, 3000);
+
+            // 🐾 v74: 清空本轮结果
+            __lastResults = { comments: [], dms: [] };
+
+            await checkComments(page);
+            await checkDMs(page);
+
+            // 🐾 v74: 发送本轮报告
+            reportCheck();
+        } catch (e) {
+            // v70.1: detached Frame 自动恢复
+            if (e.message.includes('detached')) {
+                log('⚠️ detached Frame 错误,尝试恢复页面...');
+                try {
+                    await ensurePageAlive();
+                    log('✅ 页面已恢复，跳过本轮检查');
+                } catch(r) {
+                    log(`❌ 页面恢复失败:${r.message}`);
+                }
+            } else {
+                log(`❌ 轮询异常:${e.message},安全网已接住,继续下一轮`);
+            }
+        }
+
+        // 🐾 递归调度下一次检查(随机间隔)- 加 .catch 防止递归链断裂
+        scheduleNextCheck().catch(e => {
+            log(`❌ 调度异常:${e.message},但安全网已兜底,30秒后强制重启调度`);
+            setTimeout(() => scheduleNextCheck(), 30000);
+        });
+    }
+
+    // 启动第一次调度
+    scheduleNextCheck().catch(e => {
+        log(`❌ 首次调度异常:${e.message},30秒后强制重启调度`);
+        setTimeout(() => scheduleNextCheck(), 30000);
+    });
+}
+
+if (process.argv.includes('--daemon')) {
+    main().catch(e => { log(`❌ 启动失败:${e.message}`); process.exit(1); });
+}
