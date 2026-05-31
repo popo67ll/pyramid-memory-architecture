@@ -1,0 +1,6 @@
+{
+  "lastCheck": null,
+  "lastCheckDate": null,
+  "nextCheck": "2026-06-03",
+  "note": "首次创建，等待第一次心跳触发后执行冗余检查"
+}
