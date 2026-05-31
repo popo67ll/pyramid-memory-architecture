@@ -1,6 +1,6 @@
 ---
 name: 金字塔记忆架构
-version: 3.0.0
+version: 3.1.0
 description: 通用 AI Agent 记忆架构 Skill。采用"金字塔"分层结构:顶层(AGENTS.md)只放铁律级行为规则,中层(MEMORY.md/SOUL.md/HEARTBEAT.md)放业务规则和人格配置,底层(SKILL.md/TOOLS.md)放技术实现细节。适用于所有新建子 Agent 工作区初始化。触发场景:创建新 Agent、初始化工作区、记忆架构设计、规则录入引导、md 文件冗余检查。
 ---
 
@@ -8,7 +8,7 @@ description: 通用 AI Agent 记忆架构 Skill。采用"金字塔"分层结构:
 
 > 本 Skill 提供一套标准化的 Agent 记忆分层架构,适用于任何新建子 Agent 工作区。
 > 核心理念:**规则按触发优先级分层存放,引导只能从上往下,下层不引导回上层。**
-> 版本:**v3.0** - 规则分类决策树 + 动态词指纹检查 + Skill 自包含原则
+> 版本:**v3.1** - 冗余检查触发机制(Heartbeat+状态文件/cron方案) + 触发状态管理
 
 ## 📐 架构总览
 
@@ -278,6 +278,34 @@ MEMORY.md(业务规则)
 
 **每 3 天执行一次 9 项检查清单，发现后按照金字塔架构规则，推荐主人清理，主人确认后执行。**
 
+### 触发机制配置
+<!-- #trigger-setup -->
+
+冗余检查**不会自动触发**，需要手动配置触发器。根据 Agent 类型选择方案：
+
+**方案 A：Heartbeat + 状态文件（推荐，适用于有心跳的 Agent）**
+
+1. **在 `HEARTBEAT.md` 添加任务**：
+   ```markdown
+   ## 🔺 金字塔冗余检查（每 3 天一次）
+   1. 读取 `memory/redundancy-check-state.json`，检查 `lastCheckDate`
+   2. 如果距今天 ≥ 3 天，或 `lastCheck` 为 `null`（首次），则执行
+   3. 按本 Skill `#redundancy-check` 的 9 项清单逐一检查
+   4. 向主人汇报结果（只汇报，不擅自修改，等确认再清理）
+   5. 更新 `memory/redundancy-check-state.json` 的 `lastCheck` 和 `lastCheckDate`
+   ```
+2. **创建状态文件** `memory/redundancy-check-state.json`：
+   ```json
+   {
+     "lastCheck": null,
+     "lastCheckDate": null
+   }
+   ```
+
+**方案 B：cron 定时任务（无心跳的 Agent）**
+
+隔离会话无法读取 Skill，必须把 9 项检查流程完整写在 cron prompt 里，不能用「详见 SKILL.md」引导。
+
 ### 9 项检查清单
 
 1. **内容冗余**:同一规则是否出现在多个文件中
@@ -299,8 +327,9 @@ MEMORY.md(业务规则)
 
 ### 执行步骤
 
-1. 读取所有 md 文件内容
-2. 逐项检查上述 9 项清单
+1. **读取触发状态**：先读 `memory/redundancy-check-state.json`，判断是否满足 3 天间隔（仅 Heartbeat 方案）
+2. 读取所有 md 文件内容
+3. 逐项检查上述 9 项清单
 3. 第7项(金字塔合规):
    a. 动态词指纹提取:扫描所有 SKILL.md,提取技术关键词
    b. 用动态词指纹匹配 MEMORY.md,发现技术细节错位→建议移至 SKILL.md
@@ -309,8 +338,9 @@ MEMORY.md(业务规则)
    e. 检查 MEMORY.md 是否违反 Skill 自包含原则(含操作步骤/API/标题公式等)
 4. 第8项(连接建议):只在发现明显主题相关的规则时才建议级联(如两条都是运维安全类),不强制
 5. 第9项(HEARTBEAT vs cron):读取 HEARTBEAT.md 所有提醒规则，与 cron jobs.json 中对应任务的 schedule 比对，时间/频率不一致的列出差异，提醒主人手动同步
-6. 按照金字塔架构规则,以高层级文件为准,删除低层级重复
-7. 向主人汇报检查结果,确认后执行清理
+8. 按照金字塔架构规则,以高层级文件为准,删除低层级重复
+9. 向主人汇报检查结果,确认后执行清理
+10. **更新状态文件**：写入当前时间到 `memory/redundancy-check-state.json`（仅 Heartbeat 方案）
 
 ### 检查报告模板
 
@@ -383,5 +413,6 @@ workspace-{name}/
 ## 📖 版本历史
 
 | 版本 | 日期 | 变更 |
+| v3.1 | 2026-05-31 | **冗余检查触发机制**:1新增触发机制配置章节(Heartbeat+状态文件/cron定时任务两种方案);2新增状态文件格式说明;3执行步骤增加状态读取和更新逻辑;4明确隔离会话无法读Skill的限制 ✅ |
 | v3.0 | 2026-05-27 | **规则分类决策树+动态词指纹+Skill自包含**:1新增规则分类决策树(5类判断矩阵),录入流程必须先过决策树;2第7项升级为动态词指纹检查(自动扫描SKILL.md提取技术关键词,匹配MEMORY.md发现错位规则);3新增Skill自包含原则(Skill必须独立指导完整流程,不依赖MEMORY.md);4细化各层"应该/不应该"表格(新增SKILL.md应放操作步骤/API调用/标题公式,不应放业务触发逻辑) ✅ |
 | v2.9 | 2026-05-26 | **无锚点规则检测**:冗余检查新增扫描未锚定规则的能力,自动发现含"铁律/规则/禁止/必须"等关键词但无锚点的内容,推荐补锚点并按金字塔架构归类 ✅ |
