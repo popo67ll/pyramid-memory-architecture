@@ -1,14 +1,14 @@
 ---
 name: 金字塔记忆架构
-version: 3.1.0
-description: 通用 AI Agent 记忆架构 Skill。采用"金字塔"分层结构:顶层(AGENTS.md)只放铁律级行为规则,中层(MEMORY.md/SOUL.md/HEARTBEAT.md)放业务规则和人格配置,底层(SKILL.md/TOOLS.md)放技术实现细节。适用于所有新建子 Agent 工作区初始化。触发场景:创建新 Agent、初始化工作区、记忆架构设计、规则录入引导、md 文件冗余检查。
+version: 3.4.0
+description: 通用 AI Agent 记忆架构 Skill。采用"金字塔"分层结构:顶层(AGENTS.md)只放铁律级行为规则,中层(MEMORY.md/SOUL.md/HEARTBEAT.md)放业务规则和人格配置,底层(SKILL.md/TOOLS.md)放技术实现细节。适用于所有新建子 Agent 工作区初始化。触发场景:创建新 Agent、初始化工作区、记忆架构设计、规则录入引导、md 文件冗余检查、触发机制职责划分、任务归属标记检查。
 ---
 
 # 金字塔记忆架构(Pyramid Memory Architecture)
 
 > 本 Skill 提供一套标准化的 Agent 记忆分层架构,适用于任何新建子 Agent 工作区。
 > 核心理念:**规则按触发优先级分层存放,引导只能从上往下,下层不引导回上层。**
-> 版本:**v3.1** - 冗余检查触发机制(Heartbeat+状态文件/cron方案) + 触发状态管理
+> 版本:**v3.4** - 第9项新增:Heartbeat-Cron任务归属标记检查(杜绝重复执行)
 
 ## 📐 架构总览
 
@@ -323,7 +323,38 @@ MEMORY.md(业务规则)
    - **Step 4**: 同时检查 AGENTS.md 中是否包含操作/技术类内容（应下放至 SKILL.md）
    - **Step 5**: 检查 MEMORY.md 中是否包含铁律/红线类内容（应上移至 AGENTS.md）
 8. **连接建议**:只在发现明显主题相关的规则时才建议级联,不全量扫描
-9. **HEARTBEAT vs cron 一致性**:HEARTBEAT.md 的提醒时间/频率与 cron 任务 schedule 是否一致，不一致时提醒主人手动同步 cron（只提醒，不自动改）
+9. **触发机制职责划分+健康检查+通道校验+触发-流程链路完整性**:
+   - **三域扫描**:扫描当前agent自己workspace下的HEARTBEAT.md流程规则、当前agent的cron任务列表、当前agent的launchd任务列表(**只检查本agent区域,不干涉其他agent**)
+   - **同域去重**:
+     - Cron内部:同一个功能不能建两个cron任务
+     - Launchd内部:不能重复配置
+     - Cron vs Launchd:同一功能不能既配cron又配launchd脚本
+     - ⚠️ HEARTBEAT.md vs Cron**不去重**(它们是配套关系:流程说明书+闹钟)
+   - **触发状态健康检查**:
+     - **Heartbeat**:检查当前agent的heartbeat是否启用、间隔是否正常、上次触发时间
+     - **Cron**:检查当前agent的cron任务status是否为ok、Last是否有值(证明跑过)、有无失败记录
+     - **Launchd**:检查PID是否存在、LastExitStatus是否为0(正常退出)、有无crash重启
+     - 发现问题标记:⚠️配置了但没触发 / ⚠️触发了但失败 / ⚠️从来没跑过
+   - **触发机制职责划分**:
+     - 逐个分析任务特性,推荐最适合的机制:
+       - **launchd**(macOS系统级):不需要OpenClaw会话的独立任务,如脚本执行、文件备份、系统健康检查
+       - **Cron**(OpenClaw内置):需要精确时间点触发、隔离会话执行的任务,如"周三14:00开会""每日23:00写日志"
+       - **Heartbeat**(OpenClaw主会话唤醒):不需要精确时间点,定期唤醒判断状态再执行的任务,如"每3天冗余检查""值班日判断"
+   - **推送通道校验**:
+     - 检查每个提醒任务的delivery target(agent+channel)是否与任务类型匹配
+     - 工作类应走微信通道,舞蹈类可走石榴的QQ通道,运维类走栗子QQ通道
+     - 发现问题标记:⚠️工作提醒推到了QQ / ⚠️舞蹈提醒推到了微信 / ⚠️推送到不存在的通道
+   - **触发-流程链路完整性**:
+     - HEARTBEAT.md有流程 → 有没有对应cron触发?(防遗漏)
+     - cron有任务 → prompt有没有正确引用HEARTBEAT.md对应区块?(防断链)
+     - cron prompt是否包含"读HEARTBEAT.md第X区块,按流程执行"的明确指令?(隔离会话必须一句话写完规则,不能跳转引用)
+     - 有没有cron触发了但HEARTBEAT.md没对应流程的?(防空转)
+   - **Heartbeat-Cron任务归属标记检查**:
+     - HEARTBEAT.md每个任务是否明确标注归属?(cron/heartbeat/流程参考)
+     - 已配cron的任务 → HEARTBEAT.md是否标记为"流程参考"或"走cron",避免heartbeat重复执行?
+     - 没有配cron的任务 → 是否标注为"heartbeat待执行"?
+     - 发现问题标记:⚠️任务归属不明 / ⚠️已配cron但HEARTBEAT未标注流程参考
+   - 生成报告汇报给主人,等确认后再调整,不自动修改
 
 ### 执行步骤
 
@@ -337,7 +368,15 @@ MEMORY.md(业务规则)
    d. 扫描 MEMORY.md,发现铁律/红线类内容→建议上移至 AGENTS.md
    e. 检查 MEMORY.md 是否违反 Skill 自包含原则(含操作步骤/API/标题公式等)
 4. 第8项(连接建议):只在发现明显主题相关的规则时才建议级联(如两条都是运维安全类),不强制
-5. 第9项(HEARTBEAT vs cron):读取 HEARTBEAT.md 所有提醒规则，与 cron jobs.json 中对应任务的 schedule 比对，时间/频率不一致的列出差异，提醒主人手动同步
+5. 第9项(触发机制职责划分+健康检查+通道校验+链路完整性+归属标记):
+   a. 扫描当前agent自己workspace下的HEARTBEAT.md所有流程规则(cron和launchd只查当前agent的,通过agentId过滤,不干涉其他agent)
+   b. 同域去重:cron内部/cron与launchd之间的重复任务
+   c. 触发状态健康检查:Heartbeat启用状态、Cron Last值、Launchd PID和ExitStatus
+   d. 触发机制职责划分:逐个分析推荐最适合机制(launchd/cron/heartbeat)
+   e. 推送通道校验:检查delivery target是否与任务类型匹配
+   f. 触发-流程链路完整性:HEARTBEAT.md流程vs cron prompt双向检查,确保链路完整
+   g. 任务归属标记检查:HEARTBEAT.md每个任务是否明确标注归属(cron/heartbeat/流程参考)
+   h. 生成报告,汇报给主人,等确认后再调整
 8. 按照金字塔架构规则,以高层级文件为准,删除低层级重复
 9. 向主人汇报检查结果,确认后执行清理
 10. **更新状态文件**：写入当前时间到 `memory/redundancy-check-state.json`（仅 Heartbeat 方案）
@@ -357,11 +396,16 @@ MEMORY.md(业务规则)
 | 文件大小 | ✅/❌ | ... |
 | 金字塔合规 | ✅/❌ | 动态词指纹检查结果 + 层级错位详情 |
 | 连接建议 | 💡/无 | 仅明显相关时建议 |
-| HEARTBEAT vs cron | ✅/⚠️ | 提醒时间/频率一致或提醒同步 |
+| 触发机制划分+链路完整性 | ✅/⚠️ | 三域职责划分+健康检查+通道校验+触发-流程链路完整性(仅本agent区域) |
 
 发现问题:[描述]
 层级放错建议:[描述]
-cron 同步提醒:[HEARTBEAT.md 与 cron 不一致时列出,提醒主人手动修改]
+重复触发风险:[同一任务出现在两个及以上机制中时列出]
+触发健康告警:[配置了但没触发/触发了但失败/从来没跑过的任务]
+通道校验告警:[工作提醒推到了QQ/舞蹈提醒推到了微信/推送到不存在的通道]
+链路完整性告警:[HEARTBEAT有流程但无cron触发/cron有任务但HEARTBEAT无对应流程/cron prompt未正确引用HEARTBEAT区块]
+归属标记告警:[任务归属不明/已配cron但HEARTBEAT未标注流程参考/未标注heartbeat待执行]
+归类建议:[每个任务推荐放的触发机制及理由]
 连接建议:[仅明显相关时才提]
 建议操作:[描述]
 ```
@@ -413,6 +457,5 @@ workspace-{name}/
 ## 📖 版本历史
 
 | 版本 | 日期 | 变更 |
-| v3.1 | 2026-05-31 | **冗余检查触发机制**:1新增触发机制配置章节(Heartbeat+状态文件/cron定时任务两种方案);2新增状态文件格式说明;3执行步骤增加状态读取和更新逻辑;4明确隔离会话无法读Skill的限制 ✅ |
-| v3.0 | 2026-05-27 | **规则分类决策树+动态词指纹+Skill自包含**:1新增规则分类决策树(5类判断矩阵),录入流程必须先过决策树;2第7项升级为动态词指纹检查(自动扫描SKILL.md提取技术关键词,匹配MEMORY.md发现错位规则);3新增Skill自包含原则(Skill必须独立指导完整流程,不依赖MEMORY.md);4细化各层"应该/不应该"表格(新增SKILL.md应放操作步骤/API调用/标题公式,不应放业务触发逻辑) ✅ |
-| v2.9 | 2026-05-26 | **无锚点规则检测**:冗余检查新增扫描未锚定规则的能力,自动发现含"铁律/规则/禁止/必须"等关键词但无锚点的内容,推荐补锚点并按金字塔架构归类 ✅ |
+| v3.4 | 2026-05-31 | **第9项新增任务归属标记检查**:1新增HEARTBEAT-Cron任务归属标记检查(每个任务必须标注归属:走cron/走heartbeat/流程参考);2防止已配cron的任务被heartbeat重复执行;3HEARTBEAT.md已配cron任务应标注为"流程参考"未配cron任务标注为"heartbeat待执行";4发现问题标记告警;5生成报告不自动修改 ✅ |
+| v3.3 | 2026-05-31 | **第9项重构为触发-流程链路完整性**:1明确HEARTBEAT.md=Cron配套关系(流程说明书+闹钟)不去重;2新增同域去重(cron内部/cron与launchd);3新增Agent隔离(只查本agent区域,按agentId过滤,不干涉其他agent);4新增推送通道校验(agent+channel匹配);5新增触发-流程链路完整性双向检查(HEARTBEAT流程vs cron prompt);6新增cron prompt规范(隔离会话一句话写完规则,禁止跳转引用);7生成报告不自动修改 ✅ |
