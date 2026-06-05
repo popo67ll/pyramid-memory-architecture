@@ -35,6 +35,7 @@ const CONFIG = {
     COMMENTS_FILE: '/tmp/douyin_comments.json',  // 评论缓存
     DMS_FILE: '/tmp/douyin_dms.json',             // 私信缓存
     COOLDOWN_FILE: '/tmp/douyin_cooldown.json',   // 冷却时间持久化
+    REPLIED_FILE: '/tmp/douyin_replied.json',     // 旧版数据迁移用(已废弃)
     MAX_VIDEOS: 5,  // v28.1: 每轮检查最新 5 条视频,覆盖有评论的
     MAX_REPLIES_PER_RUN: 5,  // 每轮最多回复 5 条(v25加固:更保守的真人节奏)
     DAILY_REPLY_LIMIT: 40,   // 🐾 v42: 每日回复上限 40 条,防风控
@@ -49,12 +50,12 @@ const CONFIG = {
 // 隐式标记(零宽字符,用户看不见,用于检测是否是我们回的)
 const INVISIBLE_MARK = '\u200B\u200C';
 
-// ====== 豆包·火山方舟 API 配置 ======
+// ====== 豆包·火山方舟 API 配置(2026-06-02 切 Coding Plan) ======
 const AI_CONFIG = {
     BASE_URL: 'https://ark.cn-beijing.volces.com',
     API_PATH: '/api/v3/chat/completions',
     API_KEY: 'ark-adca64b0-24b3-4ebf-b105-97caa3fa3a1d-c1785',
-    MODEL: 'ep-m-20260418183606-x48jv',  // 豆包 Seed 1.6 Vision 自定义端点
+    MODEL: 'ep-m-20260418183606-x48jv',
     TIMEOUT: 8000,      // 8 秒超时,防止卡死
     MAX_TOKENS: 150,    // 闲聊回复控制在 150 token 内
     TOKEN_FILE: '/Users/popoll/.openclaw/workspace/skills/抖音自动化/douyin-auto-ops/data/token_usage.json',
