@@ -1,6 +1,6 @@
 /**
  * 石榴·嗨舞舞室抖音自动回复系统
- * 版本: v75.0 - 修复时间正则漏匹配（纯昨天/小时前/天前）+ 陌生人私信提取修复
+ * 版本: v76.0 - 修复私信缓存 key 仅用用户名导致漏回复 bug
  * 日期: 2026-05-21
  */
 
@@ -302,11 +302,11 @@ const COMMENT_REPLIES = {
         return '价格挺实惠的~具体价目私信我发你,选适合的方案就行~';
     },
     beginner: '完全可以呀~我们好多学员都是零基础的,来了跟着入门班慢慢学就行,放心来~',
-    schedule: '工作日晚上和周末都有课~具体课表私信我发你看看,选自己方便的时间就行~',
+    schedule: '上午10点、下午3点、傍晚5点半、晚上7点都有课~具体课表私信我发你看看,选自己方便的时间就行~',
     location: '在南阳市锦湖电脑城院内 5 楼,到了找嗨舞舞室就行~挺好找的,私信我发你具体定位~',
-    kids: '有少儿班的~4-12 岁小朋友都可以,具体私信聊哈~',
+    kids: '少儿班具体安排可以加瑶瑶老师微信问问哦~我发你~',
     trial: '有体验课的!9.9 元一节,一个半小时~想来的话私信我帮你约时间~',
-    dance: '我们有两位老师哦~瑶瑶老师教各种风格爵士和KPOP,刘祺老师教编舞和HipHop~你想学哪种?私信了解更多~',
+    dance: '我们三位老师哦~瑶瑶老师教爵士/KPOP/HEELS/古风/URBAN,刘祺老师教URBAN和HipHop,桃桃老师教JAZZ基本功~你想学哪种?私信了解更多~',
     promotion: function() {
         return '有新活动会第一时间发哦~关注下我们的动态~也可以私信我,有优惠第一时间通知你~';
     },
@@ -339,7 +339,7 @@ const DM_REPLIES = {
     },
     schedule: function() {
         const variants = [
-            '哈喽~课表挺灵活的,工作日晚上和周末全天都有课~我发你最新的看看~',
+            '哈喽~课表挺灵活的,上午10点、下午3点、傍晚5点半、晚上7点都有课~我发你最新的看看~',
             '时间很灵活的~晚上和周末都有,你大概想什么时候来~',
         ];
         return variants[Math.floor(Math.random() * variants.length)];
@@ -347,8 +347,8 @@ const DM_REPLIES = {
     location: '我们在南阳市车站路与工业南路交叉口·锦湖电脑城院内 5 楼~交通很方便,导航搜锦湖电脑城就行~',
     kids: function() {
         const variants = [
-            '哈喽~我们有少儿舞蹈班,4-12 岁小朋友都可以~',
-            '有少儿班的~带小朋友来体验看看~',
+            '哈喽~少儿班具体安排可以加瑶瑶老师微信问问哦~我发你~',
+            '少儿班的情况可以加瑶瑶老师微信详细问下~我发你~',
         ];
         return variants[Math.floor(Math.random() * variants.length)];
     },
@@ -361,8 +361,8 @@ const DM_REPLIES = {
     },
     dance: function() {
         const variants = [
-            '哈喽~两位老师:瑶瑶老师教各种风格的爵士舞和KPOP,刘祺老师教编舞和HipHop~',
-            '两位老师哦~瑶瑶教爵士KPOP,刘祺教编舞HipHop~你想学哪种~',
+            '哈喽~三位老师:瑶瑶老师教爵士/KPOP/HEELS/古风/URBAN,刘祺老师教URBAN和HipHop,桃桃老师教JAZZ基本功~',
+            '三位老师哦~瑶瑶教爵士KPOP,刘祺教URBAN和HipHop,桃桃教JAZZ基本功~你想学哪种~',
         ];
         return variants[Math.floor(Math.random() * variants.length)];
     },
@@ -401,7 +401,7 @@ const KEYWORDS = {
 };
 
 // ==================== 🐾 AI 回复反馈系统 ====================
-const FEEDBACK_FILE = '/Users/popoll/.openclaw/workspace/skills/douyin-auto-ops/douyin-reply-feedback.md';
+const FEEDBACK_FILE = '/Users/popoll/.openclaw/workspace/skills/舞室运营/hi-dance-studio/嗨舞客服人设.md';
 let feedbackCache = { lastMod: 0, content: '' };
 
 function loadFeedback() {
@@ -529,7 +529,7 @@ function callAI(content, type = 'comment') {
         const url = new URL(AI_CONFIG.API_PATH, AI_CONFIG.BASE_URL);
 
         const basePrompt = type === 'dm'
-            ? '你是嗨舞舞蹈工作室的运营者,负责回复私信。⚠️对方已经在私信里了,绝对不要再说"私信我/私信聊/私信你"这种话!语气要像真人朋友聊天一样,有趣、有梗、会调侃,不要像客服机器人。回复要简短(50字以内),适当使用emoji。如果对方问价格/地址/课表/体验课,直接回答即可,不需要引导私信。舞室在南阳市锦湖电脑城院内5楼。舞室有两位老师:瑶瑶老师教各种风格的爵士舞和KPOP,刘祺老师教编舞和HipHop。回答重点问题后可以加一句轻松调侃,让聊天更有趣。注意:如果对方主动要微信/联系方式,直接给瑶瑶老师微信号(格式要多样化,用横杠/空格/中文数字交替,不要每次都写纯数字);如果对方没要,聊了1-2轮后可以在回复末尾自然引导加微信,不要太刻意。'
+            ? '你是嗨舞舞蹈工作室的运营者,负责回复私信。⚠️对方已经在私信里了,绝对不要再说"私信我/私信聊/私信你"这种话!语气要像真人朋友聊天一样,有趣、有梗、会调侃,不要像客服机器人。回复要简短(50字以内),适当使用emoji。如果对方问价格/地址/课表/体验课,直接回答即可,不需要引导私信。舞室在南阳市锦湖电脑城院内5楼。舞室有三位老师:瑶瑶老师教爵士/KPOP/HEELS/古风/URBAN,刘祺老师教URBAN和HipHop,桃桃老师教JAZZ基本功。回答重点问题后可以加一句轻松调侃,让聊天更有趣。注意:如果对方主动要微信/联系方式,直接给瑶瑶老师微信号(格式要多样化,用横杠/空格/中文数字交替,不要每次都写纯数字);如果对方没要,聊了1-2轮后可以在回复末尾自然引导加微信,不要太刻意。'
             : '你是嗨舞舞蹈工作室的抖音账号运营者,负责回复评论区。语气要像真人朋友聊天一样,有趣、有梗、会调侃,不要像客服机器人。回复要简短(50字以内),适当使用emoji。【闲聊/夸奖类(好棒、好看、喜欢等)】正常闲聊回应即可,谢谢夸奖、开心调侃,不要提私信、不要推课。【业务咨询类(价格、地址、课表、体验课)】简单回答后引导私信获取详情。不要在评论区暴露舞室地址和老师名字。⚠️绝对不要提"没有电梯"!⚠️绝对不要在评论区暴露老师名字!只说"老师"或"我们老师"。⚠️绝对不要在评论区暴露舞室地址!不要说"锦湖电脑城"或任何具体地址。不要给微信号。';
 
         const studioPrompt = buildStudioDataPrompt();
@@ -648,7 +648,7 @@ function callAIWithHistory(userMessage, history, wechatGiven, type = 'dm') {
             const identity = identityMatch ? identityMatch[1].trim() : '';
             systemPrompt = `你是嗨舞舞蹈工作室的运营AI。\n\n【身份】\n${identity}\n\n【私信回复规则】\n${basePrompt}${statusText}${historyText}${studioText}${fbInstruction}`;
         } else {
-            systemPrompt = `你是嗨舞舞蹈工作室的运营者,负责回复私信。⚠️对方已经在私信里了,绝对不要再说"私信我/私信聊/私信你"这种话!语气要像真人朋友聊天一样,有趣、有梗、会调侃,不要像客服机器人。回复要简短(50字以内),适当使用emoji。如果对方问价格/地址/课表/体验课,直接回答即可,不需要引导私信。舞室在南阳市锦湖电脑城院内5楼。舞室有两位老师:瑶瑶老师教各种风格的爵士舞和KPOP,刘祺老师教编舞和HipHop。回答重点问题后可以加一句轻松调侃,让聊天更有趣。注意:如果对方主动要微信/联系方式,直接给瑶瑶老师微信号(格式要多样化,不要每次都写纯数字);如果对方没要,聊了1-2轮后可以在回复末尾自然引导加微信,不要太刻意。${statusText}${historyText}${studioText}`;
+            systemPrompt = `你是嗨舞舞蹈工作室的运营者,负责回复私信。⚠️对方已经在私信里了,绝对不要再说"私信我/私信聊/私信你"这种话!语气要像真人朋友聊天一样,有趣、有梗、会调侃,不要像客服机器人。回复要简短(50字以内),适当使用emoji。如果对方问价格/地址/课表/体验课,直接回答即可,不需要引导私信。舞室在南阳市锦湖电脑城院内5楼。舞室有三位老师:瑶瑶老师教爵士/KPOP/HEELS/古风/URBAN,刘祺老师教URBAN和HipHop,桃桃老师教JAZZ基本功。回答重点问题后可以加一句轻松调侃,让聊天更有趣。注意:如果对方主动要微信/联系方式,直接给瑶瑶老师微信号(格式要多样化,不要每次都写纯数字);如果对方没要,聊了1-2轮后可以在回复末尾自然引导加微信,不要太刻意。${statusText}${historyText}${studioText}`;
         }
 
         const url = new URL(AI_CONFIG.API_PATH, AI_CONFIG.BASE_URL);
@@ -2783,9 +2783,11 @@ const checkDMs = async (page) => {
             log(`⚠️ 无法获取有效消息内容,跳过`);
             continue;
         }
-        const cacheKey = dm.name;
+        // 🐾 v76: 缓存 key = 用户名 + 消息内容(前50字)
+        // 修复: 之前只用用户名做 key,导致用户发新消息也被跳过
+        // 现在只有"同一用户+同一消息"才跳过,用户发新消息会正常回复
+        const cacheKey = dm.name + '|' + (actualMessage || '').substring(0, 50);
 
-        // 🐾 v65: 私信去重改用用户名 - 不管消息内容变没变,同一用户同一轮不再回复
         if (replied.dms.includes(cacheKey)) {
             log(`i️ 已回复过该消息,跳过: ${cacheKey}`);
             continue;
@@ -3235,7 +3237,7 @@ async function main() {
     // 写入当前 PID
     fs.writeFileSync(pidFile, process.pid.toString());
 
-    log('\n🐾 石榴·嗨舞舞室抖音自动回复系统 v75.0 启动(三层推送:QQ API→CLI→队列兜底+单例检查+发送确认机制)');
+    log('\n🐾 石榴·嗨舞舞室抖音自动回复系统 v76.0 启动(三层推送:QQ API→CLI→队列兜底+单例检查+发送确认机制)');
     log('🛡️ Stealth 反检测已启用');
     log('🎯 真人鼠标轨迹 + 打字节奏 + 随机间隔已启用');
     log('📍 按 Ctrl+C 停止');
